@@ -1887,12 +1887,72 @@ def _warn_no_oauth_credentials(label, email, field_count, config_hint):
     log_event("ERROR", f"  → expected format: email:password:refresh_token:client_id")
 
 
+async def discover_hotmail007_mail_types(client_key, base_api="https://gapi.hotmail007.com/api"):
+    """Ask the broker which mailTypes actually exist.
+
+    There is no published list, and guessing names just earns
+    'code=27002: Unknown mail type'. Probe the endpoints a broker of this
+    shape typically exposes and print whatever comes back so the real
+    product names can be read off the response.
+    """
+    key = (client_key or "").strip()
+    if not key:
+        log_event("ERROR", "cannot discover mail types without hotmail007_key")
+        return []
+
+    candidates = [
+        f"{base_api}/mail/getMailType?clientKey={key}",
+        f"{base_api}/mail/mailTypes?clientKey={key}",
+        f"{base_api}/mail/types?clientKey={key}",
+        f"{base_api}/mail/getTypes?clientKey={key}",
+        f"{base_api}/mail/getProduct?clientKey={key}",
+        f"{base_api}/mail/getStock?clientKey={key}",
+        f"{base_api}/product/list?clientKey={key}",
+        f"{base_api}/user/getInfo?clientKey={key}",
+    ]
+
+    log_event("INFO", f"probing {len(candidates)} endpoints for the mailType list...")
+    found = []
+    async with httpx.AsyncClient(timeout=15) as client:
+        for url in candidates:
+            path = url.split("/api/", 1)[-1].split("?")[0]
+            try:
+                r = await client.get(url)
+            except Exception as e:
+                log_event("WARNING", f"  {path}: network error ({str(e)[:60]})")
+                continue
+            if r.status_code != 200:
+                log_event("INFO", f"  {path}: HTTP {r.status_code}")
+                continue
+            body = r.text.strip()
+            try:
+                data = r.json()
+            except Exception:
+                log_event("INFO", f"  {path}: non-json -> {body[:160]}")
+                continue
+            code = data.get("code") if isinstance(data, dict) else None
+            if code not in (None, 0):
+                msg = data.get("msg") or data.get("message") or ""
+                log_event("INFO", f"  {path}: code={code} {str(msg)[:80]}")
+                continue
+            log_event("SUCCESS", f"  {path}: {json.dumps(data)[:600]}")
+            found.append((path, data))
+
+    if not found:
+        log_event("ERROR", "no discovery endpoint responded usefully")
+        log_event("ERROR", "  → open your Hotmail007 dashboard and read the product/mailType name directly")
+        log_event("ERROR", "  → or ask their support which mailType returns refresh_token credentials")
+    return found
+
+
 class Hotmail007Provider(MSGraphMailbox):
     label = "hotmail007"
 
     # Broker codes that mean "transient, try again" rather than "give up".
     # 23005 is literally returned as "Purchase failed, please try again".
     RETRYABLE_CODES = {23005, 23006, 50000}
+    # Returned when the mailType string is not a product the broker sells.
+    UNKNOWN_MAILTYPE_CODE = 27002
 
     def __init__(self, client_key, mail_type="hotmail", attempts=3):
         super().__init__()
@@ -1936,6 +1996,10 @@ class Hotmail007Provider(MSGraphMailbox):
                 log_event("ERROR", f"hotmail007: api error (code={code}): {msg}")
                 if code in self.RETRYABLE_CODES:
                     log_event("ERROR", "  → broker is out of stock or overloaded; try a different mailType or wait")
+                elif code == self.UNKNOWN_MAILTYPE_CODE:
+                    log_event("ERROR", f'  → "{self.mail_type}" is not a product this broker sells')
+                    log_event("ERROR", "  → asking the broker what it does sell:")
+                    await discover_hotmail007_mail_types(self.client_key, self.base_api)
                 return None
 
             accounts = data.get("data") or []
@@ -1960,7 +2024,7 @@ class Hotmail007Provider(MSGraphMailbox):
                     "hotmail007", email, field_count,
                     f'hotmail007_mail_type (current: "{self.mail_type}")',
                 )
-                log_event("ERROR", '  → common OAuth mailTypes: "outlook", "hotmail_trusted", "hotmail_oauth"')
+                log_event("ERROR", "  → run `python main.py --list-mailtypes` to ask the broker for its product list")
                 return None
             self.email, self.password, self.refresh_token, self.uuid = email, password, refresh_token, client_id
             return self.email
@@ -3069,6 +3133,18 @@ async def main():
     clear_screen()
     set_console_title()
     setup_files()
+
+    if "--list-mailtypes" in sys.argv:
+        loaded = load_and_validate_config()
+        if loaded is None:
+            prompt_user("press enter to exit")
+            return
+        cfg = loaded[0]
+        log_event("INFO", "querying Hotmail007 for its available mail types")
+        await discover_hotmail007_mail_types((cfg.get("hotmail007_key") or "").strip())
+        log_event("INFO", "set the product name you want as hotmail007_mail_type in config/config.yaml")
+        prompt_user("press enter to exit")
+        return
 
     loaded = load_and_validate_config()
     if loaded is None:

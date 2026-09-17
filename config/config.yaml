@@ -13,11 +13,12 @@ attempt_timeout: 240
 cybertemp_key: ""
 draxon_key: ""
 hotmail007_key: ""
-# Which Hotmail007 product to buy. IMPORTANT: the default "hotmail" often
-# sells BASIC accounts (email:password only), which cannot have their inbox
-# read — you need an OAuth product that returns
-# email:password:refresh_token:client_id. Try "outlook", "hotmail_trusted",
-# or "hotmail_oauth", or check your Hotmail007 dashboard for the exact name.
+# Which Hotmail007 product to buy. The default "hotmail" sells BASIC
+# accounts (email:password only), which cannot have their inbox read — you
+# need an OAuth product returning email:password:refresh_token:client_id.
+# Product names are broker-specific and NOT guessable: run
+#   python main.py --list-mailtypes
+# to ask the broker for its list, or read it off your Hotmail007 dashboard.
 hotmail007_mail_type: "hotmail"
 
 zeusx_key: ""
