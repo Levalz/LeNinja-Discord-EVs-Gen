@@ -323,15 +323,67 @@ async def setup_leninja(log_func=None):
 
 
 def get_brave_path() -> Optional[str]:
-    paths = [
+    """Legacy shim - callers should prefer find_browser()."""
+    info = find_browser(prefer="brave")
+    return info[1] if info else None
+
+
+BROWSER_CANDIDATES = [
+    # (display name, list of candidate executable paths)
+    ("Brave", [
         r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
         r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
         os.path.expandvars(r"%LOCALAPPDATA%\BraveSoftware\Brave-Browser\Application\brave.exe"),
-    ]
-    for p in paths:
-        if os.path.exists(p):
-            return p
+        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        "/usr/bin/brave-browser",
+        "/usr/bin/brave",
+        "/snap/bin/brave",
+    ]),
+    ("Chrome", [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+    ]),
+    ("Chromium", [
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/snap/bin/chromium",
+        "/opt/pw-browsers/chromium",
+        os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "") + "/chromium",
+    ]),
+    ("Edge", [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        "/usr/bin/microsoft-edge",
+    ]),
+]
+
+
+def find_browser(prefer=None):
+    """Return (browser_name, executable_path) for the first available browser.
+
+    If `prefer` matches one of the candidate names (case-insensitive), that
+    browser is checked first; otherwise the default order (Brave → Chrome →
+    Chromium → Edge) applies. Returns None if nothing is installed.
+    """
+    order = list(BROWSER_CANDIDATES)
+    if prefer:
+        prefer_l = prefer.lower()
+        order.sort(key=lambda entry: 0 if entry[0].lower() == prefer_l else 1)
+    for name, paths in order:
+        for p in paths:
+            if p and os.path.exists(p):
+                return name, p
     return None
+
+
+def describe_browser_candidates():
+    """Return a human-readable list of the browser install paths we look for."""
+    return "\n".join(f"  {name}: {', '.join(p for p in paths if p)}" for name, paths in BROWSER_CANDIDATES)
 
 
 try:
@@ -1780,21 +1832,25 @@ class AfhamMailProvider:
         return None
 
 
-def check_environment():
-    if get_brave_path():
-        return True
-    return False
+def check_environment(prefer=None):
+    """Return the (name, path) of the first available Chromium-family browser."""
+    return find_browser(prefer=prefer)
 
 
 class BrowserContext:
-    def __init__(self):
+    def __init__(self, prefer_browser=None):
         self.driver = None
+        self.prefer_browser = prefer_browser
 
-    async def start(self, url, extension_path=None, proxy=None, fingerprint=None):
-        brave_path = get_brave_path()
-        if not brave_path:
-            log_event("ERROR", "brave browser not found")
+    async def start(self, url, extension_path=None, proxy=None, fingerprint=None, retries=1):
+        found = find_browser(prefer=self.prefer_browser)
+        if not found:
+            log_event("ERROR", "no Chromium-family browser found. Install one of:")
+            for line in describe_browser_candidates().splitlines():
+                log_event("ERROR", line)
             return None
+        browser_name, browser_path = found
+        log_event("INFO", f"launching {browser_name} ({browser_path})")
 
         args = ["--lang=en-US"]
         if fingerprint:
@@ -1803,22 +1859,34 @@ class BrowserContext:
             args.append(f"--load-extension={extension_path}")
             args.append(f"--disable-extensions-except={extension_path}")
 
-        try:
-            self.driver = await uc.start(
-                browser_executable_path=brave_path,
-                browser_args=args,
-                proxy=proxy
-            )
-            tab = await self.driver.get(url)
-            await tab.wait_for_ready_state('complete', timeout=30000)
+        last_err = None
+        for attempt in range(retries + 1):
             try:
-                await tab.evaluate(JS_UTILS)
-            except:
-                pass
-            return tab
-        except Exception as e:
-            log_event("ERROR", f"browser start failed: {str(e)}")
-            return None
+                self.driver = await uc.start(
+                    browser_executable_path=browser_path,
+                    browser_args=args,
+                    proxy=proxy,
+                )
+                tab = await self.driver.get(url)
+                await tab.wait_for_ready_state("complete", timeout=30000)
+                try:
+                    await tab.evaluate(JS_UTILS)
+                except Exception:
+                    pass
+                return tab
+            except Exception as e:
+                last_err = e
+                log_event("WARNING", f"browser start attempt {attempt + 1} failed: {str(e)[:200]}")
+                try:
+                    if self.driver:
+                        await self.driver.stop()
+                except Exception:
+                    pass
+                self.driver = None
+                if attempt < retries:
+                    await asyncio.sleep(1.5)
+        log_event("ERROR", f"browser start failed after {retries + 1} attempts: {str(last_err)[:200]}")
+        return None
 
     async def stop(self):
         if self.driver:
@@ -1831,13 +1899,13 @@ class BrowserContext:
 
 
 class AccountCreator:
-    def __init__(self, api_key, mailbox_class, extension_path=None, proxy=None, custom_display_name=None, fingerprint=None, captcha_chain=None):
+    def __init__(self, api_key, mailbox_class, extension_path=None, proxy=None, custom_display_name=None, fingerprint=None, captcha_chain=None, prefer_browser=None):
         self.extension_path = extension_path
         self.proxy = proxy
         self.custom_display_name = custom_display_name
         self.fingerprint = fingerprint
         self.mailbox = mailbox_class(api_key)
-        self.browser = BrowserContext()
+        self.browser = BrowserContext(prefer_browser=prefer_browser)
         self.captcha_chain = captcha_chain or CaptchaSolverChain([CaptchaSolver()])
         self.password = None
         self.email = None
@@ -1881,6 +1949,8 @@ class AccountCreator:
             if not page:
                 log_event("ERROR", "browser failed")
                 return None
+
+            await self._hook_register_watcher(page)
 
             if self.fingerprint:
                 try:
@@ -2104,6 +2174,87 @@ class AccountCreator:
                 return await self.captcha_chain.solve(page)
             await asyncio.sleep(0.5)
         return True
+
+    async def _hook_register_watcher(self, page):
+        """Attach a CDP listener that logs why Discord rejects a register POST.
+
+        The extension may solve every challenge perfectly, but if Discord
+        rejects the resulting token (bad reputation, expired sitekey,
+        rate-limit) it silently issues a fresh CAPTCHA. Without this hook
+        the user sees "captcha appeared again" and no reason. With it,
+        they see e.g. "discord rejected captcha: invalid-input-response".
+        """
+        try:
+            import truedriver.cdp.network as cdp_network
+        except Exception as e:
+            log_event("WARNING", f"cdp network module unavailable: {str(e)[:120]}")
+            return
+        try:
+            await page.send(cdp_network.enable())
+        except Exception as e:
+            log_event("WARNING", f"could not enable network domain: {str(e)[:120]}")
+            return
+
+        async def on_response(event):
+            try:
+                resp = getattr(event, "response", None)
+                url = getattr(resp, "url", "") or ""
+                if "/auth/register" not in url and "/api/v9/register" not in url:
+                    return
+                status = getattr(resp, "status", 0)
+                request_id = getattr(event, "request_id", None) or getattr(event, "requestId", None)
+                if request_id is None:
+                    return
+                try:
+                    body_result = await page.send(cdp_network.get_response_body(request_id=request_id))
+                    body = body_result[0] if isinstance(body_result, tuple) else body_result
+                except Exception:
+                    body = ""
+                self._analyze_register_response(status, body)
+            except Exception:
+                pass
+
+        try:
+            page.add_handler(cdp_network.ResponseReceived, on_response)
+        except Exception as e:
+            log_event("WARNING", f"could not attach register watcher: {str(e)[:120]}")
+
+    def _analyze_register_response(self, status, body):
+        """Emit one focused error per known Discord rejection reason."""
+        text = body if isinstance(body, str) else ""
+        try:
+            payload = json.loads(text) if text else {}
+        except Exception:
+            payload = {}
+
+        if status == 429 or "1015" in text:
+            retry = payload.get("retry_after") or payload.get("retry-after")
+            log_event("ERROR", f"discord rate-limited (429{f', retry after {retry}s' if retry else ''}) - bad proxy reputation")
+            return
+
+        captcha_keys = payload.get("captcha_key") or []
+        if captcha_keys:
+            reasons = {
+                "captcha-required": "discord demanded a captcha (initial challenge)",
+                "invalid-input-response": "discord rejected the captcha token (solver returned bad answer or token expired)",
+                "sitekey-secret-mismatch": "discord's sitekey doesn't match the solver's expected one (solver key mis-configured)",
+                "response-mismatch": "discord's captcha token doesn't match its session (proxy/IP changed mid-solve)",
+                "invalid-solution": "discord rejected the specific answer (wrong tiles / wrong text)",
+            }
+            for k in captcha_keys:
+                log_event("ERROR", f"discord captcha rejection: {reasons.get(k, k)}")
+            svc = payload.get("captcha_service")
+            if svc:
+                log_event("INFO", f"discord captcha service: {svc}")
+            return
+
+        errors = payload.get("errors") or {}
+        if errors:
+            log_event("ERROR", f"discord register error: {str(errors)[:250]}")
+            return
+
+        if status >= 400:
+            log_event("ERROR", f"discord register HTTP {status}: {text[:200]}")
 
     async def get_generated_token(self, page):
         script = """
@@ -2499,8 +2650,14 @@ async def main():
     if use_vpn:
         await mullvad_ensure_connected()
 
-    if not check_environment():
-        log_event("WARNING", "brave not found")
+    prefer_browser = (cfg.get("browser") or "").strip() or None
+    browser = check_environment(prefer=prefer_browser)
+    if browser:
+        log_event("INFO", f"browser: {browser[0]} ({browser[1]})")
+    else:
+        log_event("WARNING", "no Chromium-family browser found. Candidates:")
+        for line in describe_browser_candidates().splitlines():
+            log_event("WARNING", line)
 
     proxy_pool = await build_proxy_pool(cfg)
 
@@ -2552,7 +2709,7 @@ async def main():
             try:
                 _fp_dict, _fp_raw = peek_next_fingerprint()
                 chosen_proxy = proxy_pool.next() if isinstance(proxy_pool, ProxyPool) else get_random_proxy(proxy_pool)
-                engine = AccountCreator(key, mailbox_class, extension_path=ext_path, proxy=chosen_proxy, custom_display_name=custom_display_name, fingerprint=_fp_dict, captcha_chain=captcha_chain)
+                engine = AccountCreator(key, mailbox_class, extension_path=ext_path, proxy=chosen_proxy, custom_display_name=custom_display_name, fingerprint=_fp_dict, captcha_chain=captcha_chain, prefer_browser=prefer_browser)
                 resp = await engine.run()
 
                 # Consume fingerprint after every use (one-time use)

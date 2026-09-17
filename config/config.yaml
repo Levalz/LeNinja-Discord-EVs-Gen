@@ -14,6 +14,10 @@ groq_key: ""
 anthropic_key: ""
 captcha_extension_wait: 60
 
+# Preferred browser (Brave, Chrome, Chromium, Edge). Leave empty to
+# auto-detect the first installed one in that default order.
+browser: ""
+
 proxy:
   enabled: false
   file: input/proxies.txt
