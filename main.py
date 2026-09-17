@@ -2380,7 +2380,31 @@ class AccountCreator:
                     log_event("ERROR", "form failed")
                     return None, 0
 
-                await self.handle_challenges(page)
+                if not await self.handle_challenges(page):
+                    log_event("ERROR", "captcha never cleared - abandoning attempt")
+                    return None, 0
+
+                # Discord interrupts the registration POST with the challenge.
+                # Once it clears, the form is often still sitting there holding
+                # a valid captcha token with nothing having re-fired the POST.
+                # Without this the flow polled for a verification mail that was
+                # never going to arrive, timed out, and the next attempt drew a
+                # fresh challenge - which looked like captchas "never stopping".
+                if await self._registration_pending(page):
+                    log_event("INFO", "form still pending after captcha - re-submitting")
+                    if not await self._click_submit(page):
+                        log_event("ERROR", "could not re-submit after captcha")
+                        self.last_failure_reason = "re-submit failed after captcha"
+                        return None, 0
+                    # A re-submit can draw one more challenge; clear it too.
+                    if not await self.handle_challenges(page):
+                        log_event("ERROR", "captcha after re-submit never cleared")
+                        return None, 0
+                    await asyncio.sleep(1.5)
+                    if await self._registration_pending(page):
+                        log_event("ERROR", "form still on screen after re-submit - registration rejected")
+                        self.last_failure_reason = "form not accepted after re-submit"
+                        return None, 0
 
                 result = await self.verify_email()
                 if result:
@@ -2487,53 +2511,81 @@ class AccountCreator:
                 await asyncio.sleep(0.05)
             except Exception as e:
                 pass
-            clicked = False
-            await asyncio.sleep(0.1)
-            try:
-                buttons = await page.select_all('button')
-                for button in buttons:
-                    try:
-                        text = (await button.get_text() or "").strip()
-                        if not text: text = (button.text or "").strip()
-                        if text and any(keyword in text for keyword in ['Continue', 'Create', 'Submit', 'Register']):
-                            # Mark as attempted BEFORE awaiting the click:
-                            # click() often raises because the page navigates
-                            # out from under it, and treating that as "not
-                            # clicked" made the fallbacks below fire a second
-                            # submit — which makes Discord issue a second
-                            # captcha for the same registration.
-                            clicked = True
-                            await button.click()
-                            break
-                    except Exception:
-                        continue
-            except Exception:
-                pass
+            clicked = await self._click_submit(page)
             if not clicked:
-                try:
-                    submit = await page.select('[type="submit"]', timeout=0)
-                    if submit:
-                        await submit.click()
-                        clicked = True
-                except: pass
-            if not clicked:
-                try:
-                    clicked_eval = await page.evaluate('''() => { 
-                        const buttons = document.querySelectorAll('button'); 
-                        for (const btn of buttons) { 
-                            const text = btn.textContent || ''; 
-                            if (text.includes('Continue') || text.includes('Create') || text.includes('Submit')) { 
-                                btn.click(); 
-                                return true; 
-                            } 
-                        } 
-                        return false; 
-                    }''')
-                    if clicked_eval: clicked = True
-                except Exception as e: pass
-            if not clicked: return False
+                self.last_failure_reason = "submit button not found"
+                return False
             return True
-        except Exception as e: 
+        except Exception as e:
+            log_event("ERROR", f"form fill failed: {str(e)[:150]}")
+            self.last_failure_reason = "form fill exception"
+            return False
+
+    async def _click_submit(self, page):
+        """Click the registration submit button. Returns True if one was hit.
+
+        Three strategies in order: matching button text via the element API,
+        an explicit [type=submit], then an in-page JS click. Reused for the
+        post-captcha re-submit, since Discord interrupts the original POST
+        with the challenge and the form has to be fired again once it clears.
+        """
+        await asyncio.sleep(0.1)
+        try:
+            buttons = await page.select_all('button')
+            for button in buttons:
+                try:
+                    text = (await button.get_text() or "").strip()
+                    if not text:
+                        text = (button.text or "").strip()
+                    if text and any(k in text for k in ('Continue', 'Create', 'Submit', 'Register')):
+                        # Mark as attempted BEFORE awaiting the click: click()
+                        # often raises because the page navigates out from
+                        # under it, and treating that as "not clicked" made
+                        # the fallbacks fire a second submit — which makes
+                        # Discord issue a second captcha for one registration.
+                        await button.click()
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        try:
+            submit = await page.select('[type="submit"]', timeout=0)
+            if submit:
+                await submit.click()
+                return True
+        except Exception:
+            pass
+        try:
+            return bool(await page.evaluate('''(() => {
+                const buttons = document.querySelectorAll('button');
+                for (const btn of buttons) {
+                    const t = btn.textContent || '';
+                    if (t.includes('Continue') || t.includes('Create') || t.includes('Submit')) {
+                        btn.click();
+                        return true;
+                    }
+                }
+                return false;
+            })()'''))
+        except Exception:
+            return False
+
+    async def _registration_pending(self, page):
+        """True while the registration form is still on screen unsubmitted.
+
+        After a challenge clears, Discord does not always re-fire the POST on
+        its own — the form sits there with a valid captcha token and nothing
+        happens. Detecting that is what tells us to click submit again.
+        """
+        try:
+            return bool(await page.evaluate('''(() => {
+                const email = document.querySelector('input[name="email"]');
+                if (!email) return false;
+                const r = email.getBoundingClientRect();
+                return r.width > 0 && r.height > 0;
+            })()'''))
+        except Exception:
             return False
 
     async def fill_date_of_birth(self, page):
