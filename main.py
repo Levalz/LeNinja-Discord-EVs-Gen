@@ -334,33 +334,258 @@ def get_brave_path() -> Optional[str]:
     return None
 
 
-class GroqCaptchaSolver:
-    def __init__(self, api_key: str):
-        if not GROQ_AVAILABLE:
-            raise ImportError("Groq not installed")
-        self.client = Groq(api_key=api_key)
-        self.model = "llama-3.2-90b-vision-preview"
+try:
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
 
-    def solve_text_captcha(self, image_base64: str) -> Optional[str]:
+
+_CAPTCHA_METRICS = {"tries": {}, "wins": {}}
+
+
+def _record_solver(name, success):
+    _CAPTCHA_METRICS["tries"][name] = _CAPTCHA_METRICS["tries"].get(name, 0) + 1
+    if success:
+        _CAPTCHA_METRICS["wins"][name] = _CAPTCHA_METRICS["wins"].get(name, 0) + 1
+
+
+def captcha_metrics_summary():
+    tries = _CAPTCHA_METRICS["tries"]
+    if not tries:
+        return "no captcha attempts recorded"
+    wins = _CAPTCHA_METRICS["wins"]
+    return " | ".join(f"{n}: {wins.get(n, 0)}/{c}" for n, c in tries.items())
+
+
+class CaptchaSolver:
+    """Base solver: the LeNinja/Nopecha browser extension.
+
+    Discord's CAPTCHA is hCaptcha inside an iframe; the extension solves
+    it invisibly. This solver just waits for the challenge element to
+    disappear (or a hard cap to elapse) and reports success.
+    """
+    name = "extension"
+
+    def __init__(self, wait_seconds=60):
+        self.wait_seconds = wait_seconds
+
+    async def solve(self, page):
+        deadline = time.time() + self.wait_seconds
+        while time.time() < deadline:
+            if not await _captcha_visible(page):
+                _record_solver(self.name, True)
+                return True
+            await asyncio.sleep(0.5)
+        _record_solver(self.name, False)
+        return False
+
+
+class GroqCaptchaSolver(CaptchaSolver):
+    """Groq vision fallback for text CAPTCHAs (rare Discord fallback path)."""
+    name = "groq"
+
+    def __init__(self, api_key, wait_seconds=25):
+        super().__init__(wait_seconds=wait_seconds)
+        self.api_key = (api_key or "").strip()
+        self.model = "llama-3.2-90b-vision-preview"
+        self._client = None
+        if self.api_key and GROQ_AVAILABLE:
+            try:
+                self._client = Groq(api_key=self.api_key)
+            except Exception as e:
+                log_event("WARNING", f"groq init failed: {str(e)[:150]}")
+
+    def available(self):
+        return self._client is not None
+
+    async def solve(self, page):
+        if not self.available():
+            return False
+        img = await _screenshot_captcha(page)
+        if not img:
+            return False
+        text = await asyncio.to_thread(self._solve_sync, img)
+        success = bool(text)
+        _record_solver(self.name, success)
+        if not success:
+            return False
+        return await _submit_text_answer(page, text)
+
+    def _solve_sync(self, image_base64):
         try:
-            resp = self.client.chat.completions.create(
+            resp = self._client.chat.completions.create(
                 model=self.model,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}},
-                            {"type": "text", "text": "Extract ONLY the text from this CAPTCHA."}
-                        ]
-                    }
-                ],
-                temperature=0.1,
-                max_tokens=100
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}},
+                        {"type": "text", "text": "Extract ONLY the text from this CAPTCHA image. Respond with just the characters, nothing else."},
+                    ],
+                }],
+                temperature=0.1, max_tokens=100,
             )
             return resp.choices[0].message.content.strip().replace('"', '').replace('.', '')
         except Exception as e:
-            log_event("WARNING", f"groq captcha solve failed: {str(e)[:150]}")
+            log_event("WARNING", f"groq solve failed: {str(e)[:150]}")
             return None
+
+
+class ClaudeCaptchaSolver(CaptchaSolver):
+    """Claude vision fallback for text CAPTCHAs."""
+    name = "claude"
+
+    def __init__(self, api_key, wait_seconds=25, model="claude-sonnet-5"):
+        super().__init__(wait_seconds=wait_seconds)
+        self.api_key = (api_key or "").strip()
+        self.model = model
+        self._client = None
+        if self.api_key and ANTHROPIC_AVAILABLE:
+            try:
+                self._client = anthropic.Anthropic(api_key=self.api_key)
+            except Exception as e:
+                log_event("WARNING", f"claude init failed: {str(e)[:150]}")
+
+    def available(self):
+        return self._client is not None
+
+    async def solve(self, page):
+        if not self.available():
+            return False
+        img = await _screenshot_captcha(page)
+        if not img:
+            return False
+        text = await asyncio.to_thread(self._solve_sync, img)
+        success = bool(text)
+        _record_solver(self.name, success)
+        if not success:
+            return False
+        return await _submit_text_answer(page, text)
+
+    def _solve_sync(self, image_base64):
+        try:
+            msg = self._client.messages.create(
+                model=self.model,
+                max_tokens=100,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": image_base64}},
+                        {"type": "text", "text": "Extract ONLY the text from this CAPTCHA image. Respond with just the characters, nothing else."},
+                    ],
+                }],
+            )
+            for block in msg.content:
+                if getattr(block, "type", None) == "text":
+                    return block.text.strip().replace('"', '').replace('.', '')
+        except Exception as e:
+            log_event("WARNING", f"claude solve failed: {str(e)[:150]}")
+        return None
+
+
+class CaptchaSolverChain:
+    """Tries each configured solver in order until one succeeds."""
+
+    def __init__(self, solvers):
+        self.solvers = [s for s in solvers if s is not None]
+
+    async def solve(self, page):
+        for solver in self.solvers:
+            if hasattr(solver, "available") and not solver.available():
+                continue
+            log_event("INFO", f"captcha: trying {solver.name} solver")
+            try:
+                if await solver.solve(page):
+                    log_event("SUCCESS", f"captcha solved via {solver.name}")
+                    return True
+            except Exception as e:
+                log_event("WARNING", f"captcha: {solver.name} raised {str(e)[:120]}")
+        log_event("ERROR", "captcha: all solvers exhausted")
+        return False
+
+
+async def _captcha_visible(page):
+    queries = ['iframe[src*="captcha"]', 'div[class*="captcha"]', '.h-captcha', '.g-recaptcha', '[data-sitekey]']
+    for q in queries:
+        try:
+            el = await page.query_selector(q)
+            if el and await el.is_visible():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _screenshot_captcha(page):
+    """Base64-PNG of the visible captcha area, or None if unavailable.
+
+    Best-effort: some challenge iframes are cross-origin and cannot be
+    screenshotted; those fall through and let the next solver try.
+    """
+    try:
+        for q in ['iframe[src*="captcha"]', '.h-captcha', '.g-recaptcha', '[data-sitekey]']:
+            el = await page.query_selector(q)
+            if el and await el.is_visible():
+                try:
+                    return await el.screenshot_b64()
+                except Exception:
+                    pass
+        return await page.screenshot_b64()
+    except Exception:
+        return None
+
+
+async def _submit_text_answer(page, answer):
+    """Type `answer` into the visible captcha text input and press Enter.
+
+    Only useful for the rare text-CAPTCHA fallback; hCaptcha needs the
+    extension. Returns True if we could locate a text input to send it to.
+    """
+    if not answer:
+        return False
+    try:
+        for q in ['input[name="captcha"]', 'input[aria-label*="captcha" i]', 'input[type="text"]']:
+            el = await page.query_selector(q)
+            if el and await el.is_visible():
+                try:
+                    await el.send_keys(answer)
+                except Exception:
+                    try:
+                        await el.type(answer)
+                    except Exception:
+                        continue
+                try:
+                    import truedriver.cdp.input_ as cdp_input
+                    await page.send(cdp_input.dispatch_key_event(type_="keyDown", key="Enter", windows_virtual_key_code=13, native_virtual_key_code=13))
+                    await page.send(cdp_input.dispatch_key_event(type_="keyUp", key="Enter", windows_virtual_key_code=13, native_virtual_key_code=13))
+                except Exception:
+                    pass
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def build_captcha_chain(cfg):
+    """Assemble the solver chain from config keys.
+
+    Extension is always first. AI solvers only join the chain if their
+    key is present AND their SDK is installed.
+    """
+    solvers = [CaptchaSolver(wait_seconds=int(cfg.get("captcha_extension_wait", 60)))]
+    groq_key = (cfg.get("groq_key") or "").strip()
+    if groq_key:
+        if not GROQ_AVAILABLE:
+            log_event("WARNING", "groq_key set but 'groq' package not installed - skipping")
+        else:
+            solvers.append(GroqCaptchaSolver(groq_key))
+    anthropic_key = (cfg.get("anthropic_key") or "").strip()
+    if anthropic_key:
+        if not ANTHROPIC_AVAILABLE:
+            log_event("WARNING", "anthropic_key set but 'anthropic' package not installed - skipping")
+        else:
+            solvers.append(ClaudeCaptchaSolver(anthropic_key))
+    return CaptchaSolverChain(solvers)
 
 
 JS_UTILS = '''
@@ -621,29 +846,153 @@ def make_handle():
     return name[:32].lower()
 
 
-def load_proxies(config: dict) -> list:
-    proxy_enabled = config.get("proxy", {}).get("enabled", False)
-    if not proxy_enabled:
+def _normalize_proxy(raw):
+    """Accept 'user:pass@host:port', 'host:port:user:pass', 'host:port', or a full URL.
+
+    Returns an http:// URL or None if the line can't be parsed.
+    """
+    line = (raw or "").strip()
+    if not line:
+        return None
+    if "://" in line:
+        return line
+    if "@" in line:
+        return f"http://{line}"
+    parts = line.split(":")
+    if len(parts) == 2:
+        return f"http://{parts[0]}:{parts[1]}"
+    if len(parts) == 4:
+        host, port, user, pw = parts
+        return f"http://{user}:{pw}@{host}:{port}"
+    return None
+
+
+async def _proxy_alive(proxy_url, timeout=5.0):
+    try:
+        async with httpx.AsyncClient(proxy=proxy_url, timeout=timeout) as client:
+            r = await client.get("https://api.ipify.org?format=json")
+            if r.status_code == 200 and "ip" in r.text.lower():
+                return True
+    except Exception:
+        return False
+    return False
+
+
+class ProxyPool:
+    """Round-robin pool with startup health-check and per-use demotion.
+
+    A dead proxy is retired after `max_failures` consecutive strikes; the
+    pool returns None when all proxies are dead so the caller can decide
+    to run direct or abort.
+    """
+
+    def __init__(self, proxies, max_failures=2):
+        self._all = [p for p in (_normalize_proxy(p) for p in proxies) if p]
+        self._alive = list(self._all)
+        self._failures = {p: 0 for p in self._all}
+        self._max_failures = max_failures
+        self._cursor = 0
+        self._lock = threading.Lock()
+
+    def __len__(self):
+        return len(self._alive)
+
+    def size(self):
+        return len(self._all)
+
+    async def health_check(self, concurrency=20):
+        if not self._all:
+            return 0
+        sem = asyncio.Semaphore(concurrency)
+
+        async def check(p):
+            async with sem:
+                return p, await _proxy_alive(p)
+
+        results = await asyncio.gather(*(check(p) for p in self._all), return_exceptions=False)
+        alive = [p for p, ok in results if ok]
+        with self._lock:
+            self._alive = alive
+            self._failures = {p: 0 for p in self._all}
+            self._cursor = 0
+        return len(alive)
+
+    def next(self):
+        with self._lock:
+            if not self._alive:
+                return None
+            proxy = self._alive[self._cursor % len(self._alive)]
+            self._cursor += 1
+            return proxy
+
+    def report_failure(self, proxy):
+        if proxy is None:
+            return
+        with self._lock:
+            self._failures[proxy] = self._failures.get(proxy, 0) + 1
+            if self._failures[proxy] >= self._max_failures and proxy in self._alive:
+                self._alive.remove(proxy)
+                log_event("WARNING", f"proxy retired after {self._failures[proxy]} failures: {_mask_proxy(proxy)}")
+
+    def report_success(self, proxy):
+        if proxy is None:
+            return
+        with self._lock:
+            if proxy in self._failures and self._failures[proxy] > 0:
+                self._failures[proxy] = 0
+
+
+def _mask_proxy(url):
+    if not url:
+        return "-"
+    try:
+        after = url.split("://", 1)[-1]
+        host = after.split("@")[-1]
+        return host
+    except Exception:
+        return url[:40]
+
+
+def load_proxies(config):
+    """Read the proxy file and return the raw list; ProxyPool handles the rest."""
+    proxy_cfg = (config.get("proxy") or {}) if isinstance(config, dict) else {}
+    if not proxy_cfg.get("enabled", False):
         return []
-    proxy_file = config.get("proxy", {}).get("file", "input/proxies.txt")
+    proxy_file = proxy_cfg.get("file", "input/proxies.txt")
     proxy_path = Path(get_path(proxy_file))
     if not proxy_path.exists():
+        log_event("WARNING", f"proxy enabled but file not found: {proxy_path}")
         return []
     try:
-        with open(proxy_path, 'r', encoding='utf-8') as f:
-            proxies = [line.strip() for line in f if line.strip()]
-        if proxies:
-            return proxies
-        else:
-            return []
-    except Exception as e:
+        with open(proxy_path, "r", encoding="utf-8") as f:
+            proxies = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+    except OSError as e:
+        log_event("ERROR", f"could not read proxy file: {e}")
         return []
-
-
-def get_random_proxy(proxies: list) -> str:
     if not proxies:
+        log_event("WARNING", f"proxy file is empty: {proxy_path}")
+    return proxies
+
+
+async def build_proxy_pool(config):
+    raw = load_proxies(config)
+    pool = ProxyPool(raw)
+    if pool.size() == 0:
+        return pool
+    log_event("INFO", f"health-checking {pool.size()} proxy/proxies...")
+    alive = await pool.health_check()
+    log_event("SUCCESS" if alive else "WARNING",
+              f"proxies: {alive}/{pool.size()} alive")
+    return pool
+
+
+def get_random_proxy(proxies_or_pool):
+    """Compat shim: accepts either a list (legacy) or a ProxyPool."""
+    if isinstance(proxies_or_pool, ProxyPool):
+        return proxies_or_pool.next()
+    if not proxies_or_pool:
         return None
-    return random.choice(proxies)
+    return random.choice(proxies_or_pool)
 
 
 MULLVADEXE = None
@@ -1482,13 +1831,14 @@ class BrowserContext:
 
 
 class AccountCreator:
-    def __init__(self, api_key, mailbox_class, extension_path=None, proxy=None, custom_display_name=None, fingerprint=None):
+    def __init__(self, api_key, mailbox_class, extension_path=None, proxy=None, custom_display_name=None, fingerprint=None, captcha_chain=None):
         self.extension_path = extension_path
         self.proxy = proxy
         self.custom_display_name = custom_display_name
         self.fingerprint = fingerprint
         self.mailbox = mailbox_class(api_key)
         self.browser = BrowserContext()
+        self.captcha_chain = captcha_chain or CaptchaSolverChain([CaptchaSolver()])
         self.password = None
         self.email = None
         self.token = None
@@ -1745,36 +2095,14 @@ class AccountCreator:
             pass
 
     async def handle_challenges(self, page):
-        try:
-            is_active = False
-            for i in range(120):
-                queries = ['iframe[src*="captcha"]', 'div[class*="captcha"]', '.h-captcha', '.g-recaptcha', '[data-sitekey]']
-                detected = False
-                for q in queries:
-                    try:
-                        el = await page.query_selector(q)
-                        if el and await el.is_visible():
-                            detected = True
-                            break
-                    except:
-                        continue
-                
-                if detected and not is_active:
-                    log_event("INFO", "mail pulled")
-                    log_event("WARNING", "captcha appeared")
-                    is_active = True
-                
-                if not detected:
-                    if is_active:
-                        log_event("INFO", "solving captcha")
-                        log_event("SUCCESS", "captcha solved")
-                        return True
-                    elif i >= 10:
-                        return True
-                
-                await asyncio.sleep(0.5)
-        except Exception as e:
-            pass
+        # Wait briefly for any challenge to appear; if none within a few
+        # seconds, the flow can proceed. If one does appear, hand it to
+        # the configured solver chain (extension first, AI fallbacks after).
+        for i in range(10):
+            if await _captcha_visible(page):
+                log_event("WARNING", "captcha appeared")
+                return await self.captcha_chain.solve(page)
+            await asyncio.sleep(0.5)
         return True
 
     async def get_generated_token(self, page):
@@ -2174,7 +2502,7 @@ async def main():
     if not check_environment():
         log_event("WARNING", "brave not found")
 
-    proxies = load_proxies(cfg)
+    proxy_pool = await build_proxy_pool(cfg)
 
     show_interface()
 
@@ -2190,6 +2518,8 @@ async def main():
 
     clear_screen()
     ext_path = await setup_leninja(log_event)
+    captcha_chain = build_captcha_chain(cfg)
+    log_event("INFO", f"captcha chain: {', '.join(s.name for s in captcha_chain.solvers)}")
     _fp_count = len(_load_fp_lines())
     if _fp_count > 0:
         log_event("INFO", f"{_fp_count} fingerprint(s) loaded from input/fp.txt")
@@ -2221,24 +2551,28 @@ async def main():
             
             try:
                 _fp_dict, _fp_raw = peek_next_fingerprint()
-                engine = AccountCreator(key, mailbox_class, extension_path=ext_path, proxy=get_random_proxy(proxies), custom_display_name=custom_display_name, fingerprint=_fp_dict)
+                chosen_proxy = proxy_pool.next() if isinstance(proxy_pool, ProxyPool) else get_random_proxy(proxy_pool)
+                engine = AccountCreator(key, mailbox_class, extension_path=ext_path, proxy=chosen_proxy, custom_display_name=custom_display_name, fingerprint=_fp_dict, captcha_chain=captcha_chain)
                 resp = await engine.run()
 
                 # Consume fingerprint after every use (one-time use)
                 if _fp_raw:
                     consume_fingerprint_line(_fp_raw)
 
-                if resp and len(resp) == 2:
-                    token, took = resp
+                run_ok = bool(resp and len(resp) == 2 and resp[0])
+                if run_ok:
+                    token = resp[0]
                     if token == "LOCKED":
                         success += 1
-                    elif token:
+                    else:
                         log_event("SUCCESS", "valid")
                         success += 1
-                    else:
-                        log_event("ERROR", f"failed #{done}")
+                    if isinstance(proxy_pool, ProxyPool):
+                        proxy_pool.report_success(chosen_proxy)
                 else:
                     log_event("ERROR", f"failed #{done}")
+                    if isinstance(proxy_pool, ProxyPool):
+                        proxy_pool.report_failure(chosen_proxy)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -2260,6 +2594,7 @@ async def main():
         
     elapsed = time.time() - start
     log_event("INFO", f"generated {success} valid tokens in ({elapsed:.1f}s)")
+    log_event("INFO", f"captcha solver stats -- {captcha_metrics_summary()}")
     prompt_user("press enter to exit")
 
 if __name__ == '__main__':

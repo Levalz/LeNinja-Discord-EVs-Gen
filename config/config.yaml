@@ -7,6 +7,13 @@ zeusx_key: ""
 afham_mail_api9_key: ""
 duckmail_key: ""
 crowmail_key: ""
+
+# AI CAPTCHA fallback keys. The LeNinja/Nopecha extension solves first;
+# these run only if the extension fails. Leave empty to disable.
+groq_key: ""
+anthropic_key: ""
+captcha_extension_wait: 60
+
 proxy:
   enabled: false
   file: input/proxies.txt
