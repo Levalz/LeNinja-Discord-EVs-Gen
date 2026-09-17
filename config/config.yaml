@@ -1,5 +1,15 @@
 vpn: false
 vpn_delay: 120
+# How many accounts to generate in parallel. Default 1 = serial (safe,
+# same as before). Bump only when your proxy pool has that many alive
+# proxies AND your extension key has enough credit — each worker uses
+# one browser instance and one solve credit per attempt. Enabling
+# workers > 1 disables Mullvad VPN rotation automatically (single-tunnel).
+# Override at runtime with `python main.py <target> <workers>`.
+workers: 1
+# Hard cap on a single account attempt (seconds). Kills stalled browsers
+# or captcha loops that never terminate. Kept generous by default.
+attempt_timeout: 240
 cybertemp_key: ""
 draxon_key: ""
 hotmail007_key: ""
@@ -7,6 +17,22 @@ zeusx_key: ""
 afham_mail_api9_key: ""
 duckmail_key: ""
 crowmail_key: ""
+
+# AI CAPTCHA fallback keys. The LeNinja/Nopecha extension solves first;
+# these run only if the extension fails. Leave empty to disable.
+# Groq deprecates preview model IDs frequently — check
+# https://console.groq.com/docs/models and set groq_model to a current
+# vision-capable model. Same for anthropic_model (claude vision model).
+groq_key: ""
+groq_model: ""          # empty = solver's built-in default
+anthropic_key: ""
+anthropic_model: ""     # empty = solver's built-in default
+captcha_extension_wait: 60
+
+# Preferred browser (Brave, Chrome, Chromium, Edge). Leave empty to
+# auto-detect the first installed one in that default order.
+browser: ""
+
 proxy:
   enabled: false
   file: input/proxies.txt

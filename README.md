@@ -1,66 +1,56 @@
-# 🌟 FREEK - AI-Powered CAPTCHA Solver
+# LeNinja - Discord EVs Generator
 
 ```
 ╔═══════════════════════════════════════════════════════════════╗
 ║                                                               ║
-║   ███████╗██████╗ ███████╗███████╗██╗  ██╗                   ║
-║   ██╔════╝██╔══██╗██╔════╝██╔════╝██║ ██╔╝                   ║
-║   █████╗  ██████╔╝█████╗  █████╗  █████╔╝                    ║
-║   ██╔══╝  ██╔══██╗██╔══╝  ██╔══╝  ██╔═██╗                    ║
-║   ██║     ██║  ██║███████╗███████╗██║  ██╗                   ║
-║   ╚═╝     ╚═╝  ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝                   ║
+║   ██╗     ███████╗███╗   ██╗██╗███╗   ██╗     ██╗ █████╗     ║
+║   ██║     ██╔════╝████╗  ██║██║████╗  ██║     ██║██╔══██╗    ║
+║   ██║     █████╗  ██╔██╗ ██║██║██╔██╗ ██║     ██║███████║    ║
+║   ██║     ██╔══╝  ██║╚██╗██║██║██║╚██╗██║██   ██║██╔══██║    ║
+║   ███████╗███████╗██║ ╚████║██║██║ ╚████║╚█████╔╝██║  ██║    ║
+║   ╚══════╝╚══════╝╚═╝  ╚═══╝╚═╝╚═╝  ╚═══╝ ╚════╝ ╚═╝  ╚═╝    ║
 ║                                                               ║
-║              AI-Powered CAPTCHA Solver v1.0                   ║
+║          Discord EVs Generator · AI CAPTCHA v1.0              ║
 ║                                                               ║
 ╚═══════════════════════════════════════════════════════════════╝
 ```
 
-## ✨ Features
+## Features
 
-- 🎨 **Vibrant UI** - Beautiful gradient design with purple, pink, cyan, and gold colors
-- 🤖 **AI-Powered** - Advanced machine learning algorithms for CAPTCHA solving
-- 🚀 **Fast & Efficient** - Solves CAPTCHAs in seconds
-- 🔒 **Secure** - Your data stays private and protected
-- 🌐 **Universal** - Supports reCAPTCHA, hCAPTCHA, FunCaptcha, and more
+- Vibrant UI - gradient design (purple, pink, cyan, gold)
+- AI-powered CAPTCHA solving
+- Fast and efficient
+- Supports reCAPTCHA, hCAPTCHA, FunCaptcha, and more
 
-## 🎯 Supported CAPTCHA Types
+## Supported CAPTCHA Types
 
-- ✅ reCAPTCHA v2 & v3
-- ✅ hCAPTCHA
-- ✅ FunCaptcha (Arkose Labs)
-- ✅ Cloudflare Turnstile
-- ✅ AWS CAPTCHA
-- ✅ GeeTest
-- ✅ Text CAPTCHA
-- ✅ PerimeterX
-- ✅ Lemin CAPTCHA
+- reCAPTCHA v2 & v3
+- hCAPTCHA
+- FunCaptcha (Arkose Labs)
+- Cloudflare Turnstile
+- AWS CAPTCHA
+- GeeTest
+- Text CAPTCHA
+- PerimeterX
+- Lemin CAPTCHA
 
-## 🚀 Quick Start
+## Quick Start
 
-1. **Install Requirements**
+1. **Install requirements**
    ```bash
    pip install -r requirements.txt
    ```
 
-2. **Configure API Key**
+2. **Configure API key**
    - Add your API key to `config/nopecha.txt`
    - Configure settings in `config/config.yaml`
 
-3. **Run the Tool**
+3. **Run the tool**
    ```bash
    python main.py
    ```
 
-## 🎨 UI Preview
-
-The extension features a stunning gradient design with:
-- 💜 Purple to Pink gradients
-- 🔵 Cyan accent colors
-- 💛 Gold highlights
-- ✨ Animated rainbow borders
-- 🌈 Glowing effects on interactive elements
-
-## ⚙️ Configuration
+## Configuration
 
 Edit `config/config.yaml` to customize:
 - VPN settings
@@ -68,28 +58,24 @@ Edit `config/config.yaml` to customize:
 - API keys
 - Cooldown timers
 
-## 📦 Extension Installation
+## Extension Installation
 
-The Freek browser extension is automatically downloaded on first run. It integrates seamlessly with:
+The LeNinja browser extension is automatically downloaded on first run. It integrates with:
 - Chrome
 - Brave
 - Edge
 - Other Chromium-based browsers
 
-## 🔧 Advanced Features
+## Advanced Features
 
-- **Proxy Support** - Rotate IPs with VPN integration
-- **Multi-Account Generation** - Create unlimited accounts
-- **Smart Cooldown** - Intelligent rate limiting
+- Proxy support - rotate IPs with VPN integration
+- Multi-account generation
+- Smart cooldown - intelligent rate limiting
 
-## 📝 License
+## License
 
 This project is for educational purposes only. Use responsibly and in accordance with the terms of service of the websites you interact with.
 
-## 🌟 Credits
-
-Freek is built with cutting-edge AI technology to provide the best CAPTCHA solving experience.
-
 ---
 
-**Made with 💜 by the Freek Team**
+Made by the LeNinja Team

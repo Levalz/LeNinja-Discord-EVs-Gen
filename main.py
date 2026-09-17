@@ -53,6 +53,42 @@ warnings.filterwarnings("ignore")
 logging.getLogger().setLevel(logging.CRITICAL)
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _strip_ansi(text):
+    return _ANSI_RE.sub("", text or "")
+
+
+_FILE_LOGGER = None
+
+
+def _get_file_logger():
+    """Rotating file logger under logs/leninja.log. Configured lazily so
+    imports/tests that never call it don't create the directory."""
+    global _FILE_LOGGER
+    if _FILE_LOGGER is not None:
+        return _FILE_LOGGER
+    import logging
+    from logging.handlers import RotatingFileHandler
+    logs_dir = Path(get_path("logs"))
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("leninja")
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    if not logger.handlers:
+        handler = RotatingFileHandler(
+            logs_dir / "leninja.log",
+            maxBytes=5 * 1024 * 1024,
+            backupCount=10,
+            encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(message)s"))
+        logger.addHandler(handler)
+    _FILE_LOGGER = logger
+    return logger
+
+
 def log_event(level, message):
     ts = datetime.now().strftime("%H:%M:%S")
     labels = {
@@ -64,6 +100,13 @@ def log_event(level, message):
     }
     label = labels.get(level.upper(), level.upper())
     print(f"{Fore.LIGHTBLACK_EX}{ts}{Style.RESET_ALL}  {label}  {Fore.WHITE}{message}{Style.RESET_ALL}")
+    try:
+        _get_file_logger().log(
+            {"SUCCESS": 20, "INFO": 20, "WARNING": 30, "ERROR": 40, "INPUT": 20}.get(level.upper(), 20),
+            _strip_ansi(str(message)),
+        )
+    except Exception:
+        pass
 
 
 def log_token(token_masked):
@@ -78,6 +121,33 @@ def prompt_user(query):
     now = datetime.now().strftime("%H:%M:%S")
     formatted = f"{Fore.LIGHTBLACK_EX}{now}{Style.RESET_ALL}  {Fore.MAGENTA}INP{Style.RESET_ALL}  {Fore.WHITE}{query}{Style.RESET_ALL}"
     return input(formatted)
+
+
+async def retry_async(coro_factory, attempts=3, base_delay=1.0, label="request", log_retries=True):
+    """Run an async operation with exponential-backoff retry + jitter.
+
+    `coro_factory` is called on every attempt so a fresh coroutine (and
+    fresh httpx client, TLS session, etc.) is produced each time.
+    CancelledError is re-raised immediately so Ctrl-C stays snappy.
+    Returns the successful result, or the last exception re-raised.
+    """
+    import asyncio as _asyncio
+    last = None
+    for i in range(attempts):
+        try:
+            return await coro_factory()
+        except _asyncio.CancelledError:
+            raise
+        except Exception as e:
+            last = e
+            if i == attempts - 1:
+                break
+            delay = base_delay * (2 ** i) + random.uniform(0, 0.5)
+            if log_retries:
+                log_event("WARNING",
+                          f"{label} attempt {i + 1}/{attempts} failed ({str(e)[:120]}), retrying in {delay:.1f}s")
+            await _asyncio.sleep(delay)
+    raise last if last is not None else RuntimeError(f"{label} failed with no exception recorded")
 
 
 def install_requirements():
@@ -123,6 +193,7 @@ class UTILS_DISCORD:
     browser_user_agent: str = ""
 
     def __init__(self):
+        self._fallback_warned = False
         self._scrape_info()
         Thread(target=self._scrape_info_loop, daemon=True).start()
 
@@ -138,10 +209,25 @@ class UTILS_DISCORD:
                 self.discord_user_agent = details["desktop"]["user-agent"]
                 self.browser_user_agent = details["browser"]["user-agent"]
                 self.x_super_properties = details["desktop"]["decoded-x-super-properties"]
-            else:
-                self._set_fallback_values()
-        except:
-            self._set_fallback_values()
+                return
+            self._use_fallback(f"HTTP {response.status_code}")
+        except Exception as e:
+            self._use_fallback(str(e)[:100])
+
+    def _use_fallback(self, why):
+        self._set_fallback_values()
+        # Only warn once per session — stale hardcoded build_number values
+        # can make Discord reject the account with an obscure "outdated
+        # client" error, so surface this instead of silently falling back.
+        if not self._fallback_warned:
+            self._fallback_warned = True
+            try:
+                log_event("WARNING",
+                          f"discord_info endpoint unreachable ({why}) - using stale hardcoded build "
+                          f"(client_build_number=485097). If accounts start failing with "
+                          f"'outdated client', bump the fallback values.")
+            except Exception:
+                pass
 
     def _set_fallback_values(self):
         self.discord_user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) discord/1.0.9220 Chrome/128.0.6613.186 Electron/32.2.7 Safari/537.36"
@@ -189,56 +275,53 @@ except ImportError:
     GROQ_AVAILABLE = False
 
 
-FREEK_EXT_ID = "dknlfmjaanfblgfdfebhijalfmhmjjjo"
-FREEK_EXT_DIR = Path(get_path("extension/nopecha_ext"))
-FREEK_KEYS_FILE = Path(get_path("config/nopecha.txt"))
+LENINJA_EXT_ID = "dknlfmjaanfblgfdfebhijalfmhmjjjo"
+LENINJA_EXT_DIR = Path(get_path("extension/nopecha_ext"))
+LENINJA_KEYS_FILE = Path(get_path("config/nopecha.txt"))
 FP_FILE = Path(get_path("input/fp.txt"))
 _fp_lock = threading.Lock()
-FREEK_KEY_INDEX = 0
+LENINJA_KEY_INDEX = 0
 
 
-def load_freek_keys() -> list:
-    if not FREEK_KEYS_FILE.exists():
-        FREEK_KEYS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        FREEK_KEYS_FILE.write_text("")
+def load_leninja_keys() -> list:
+    if not LENINJA_KEYS_FILE.exists():
+        LENINJA_KEYS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        LENINJA_KEYS_FILE.write_text("")
         return []
     keys = []
-    for line in FREEK_KEYS_FILE.read_text().splitlines():
+    for line in LENINJA_KEYS_FILE.read_text().splitlines():
         line = line.strip()
         if line and not line.startswith('#'):
             keys.append(line)
     return keys
 
 
-def get_current_freek_key() -> Optional[str]:
-    keys = load_freek_keys()
+def get_current_leninja_key() -> Optional[str]:
+    keys = load_leninja_keys()
     if not keys:
         return None
-    global FREEK_KEY_INDEX
-    return keys[FREEK_KEY_INDEX % len(keys)]
+    global LENINJA_KEY_INDEX
+    return keys[LENINJA_KEY_INDEX % len(keys)]
 
 
-def inject_freek_key(api_key: str):
-    if not api_key or not FREEK_EXT_DIR.exists():
+def inject_leninja_key(api_key: str):
+    if not api_key or not LENINJA_EXT_DIR.exists():
         return False
     ok = False
 
     # 1. Inject into manifest.json
-    manifest_path = FREEK_EXT_DIR / "manifest.json"
+    manifest_path = LENINJA_EXT_DIR / "manifest.json"
     try:
         if manifest_path.exists():
             with open(manifest_path, 'r', encoding='utf-8') as f:
                 manifest = json.load(f)
 
-            # Get all keys from nopecha.txt
-            all_keys = load_freek_keys()
+            all_keys = load_leninja_keys()
 
-            # Update nopecha.key with the first key
             if 'nopecha' not in manifest:
                 manifest['nopecha'] = {}
             manifest['nopecha']['key'] = api_key
 
-            # Update nopecha.keys with all keys
             if all_keys:
                 manifest['nopecha']['keys'] = all_keys
 
@@ -249,7 +332,7 @@ def inject_freek_key(api_key: str):
         pass
 
     # 2. Inject into settings.json
-    settings_path = FREEK_EXT_DIR / "settings.json"
+    settings_path = LENINJA_EXT_DIR / "settings.json"
     try:
         settings = {}
         if settings_path.exists():
@@ -266,7 +349,7 @@ def inject_freek_key(api_key: str):
     replacement = f'key:me(ge(),{json.dumps(api_key)})'
     pattern = re.compile(r'key:me\(ge\(\),\"[^\"]*\"\)')
     try:
-        for bundle_path in FREEK_EXT_DIR.rglob("*.js"):
+        for bundle_path in LENINJA_EXT_DIR.rglob("*.js"):
             try:
                 bundle = bundle_path.read_text(encoding="utf-8", errors="ignore")
                 new_bundle, count = pattern.subn(replacement, bundle, count=1)
@@ -278,16 +361,16 @@ def inject_freek_key(api_key: str):
     except:
         pass
     return ok
-def download_freek_ext() -> Optional[Path]:
-    if FREEK_EXT_DIR.exists() and (FREEK_EXT_DIR / "manifest.json").exists():
-        return FREEK_EXT_DIR
-    log_event("INFO", "downloading freek extension (first run)...")
-    crx_url = f"https://clients2.google.com/service/update2/crx?response=redirect&prodversion=120.0.0.0&acceptformat=crx2,crx3&x=id%3D{FREEK_EXT_ID}%26uc"
+def download_leninja_ext() -> Optional[Path]:
+    if LENINJA_EXT_DIR.exists() and (LENINJA_EXT_DIR / "manifest.json").exists():
+        return LENINJA_EXT_DIR
+    log_event("INFO", "downloading leninja extension (first run)...")
+    crx_url = f"https://clients2.google.com/service/update2/crx?response=redirect&prodversion=120.0.0.0&acceptformat=crx2,crx3&x=id%3D{LENINJA_EXT_ID}%26uc"
     try:
         with httpx.Client(follow_redirects=True) as client:
             r = client.get(crx_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=60)
             if r.status_code != 200:
-                log_event("ERROR", f"freek download failed: HTTP {r.status_code}")
+                log_event("ERROR", f"leninja download failed: HTTP {r.status_code}")
                 return None
             data = r.content
         if data[:4] == b"Cr24":
@@ -295,74 +378,526 @@ def download_freek_ext() -> Optional[Path]:
             zip_start = (12 + int.from_bytes(data[8:12], "little")) if version == 3 else (16 + int.from_bytes(data[8:12], "little") + int.from_bytes(data[12:16], "little"))
         else:
             zip_start = 0
-        FREEK_EXT_DIR.mkdir(exist_ok=True, parents=True)
+        LENINJA_EXT_DIR.mkdir(exist_ok=True, parents=True)
         with zipfile.ZipFile(io.BytesIO(data[zip_start:])) as z:
-            z.extractall(FREEK_EXT_DIR)
-        if (FREEK_EXT_DIR / "manifest.json").exists():
-            log_event("SUCCESS", "freek extension installed")
-            return FREEK_EXT_DIR
-        log_event("ERROR", "freek extract failed: manifest.json missing")
+            z.extractall(LENINJA_EXT_DIR)
+        if (LENINJA_EXT_DIR / "manifest.json").exists():
+            log_event("SUCCESS", "leninja extension installed")
+            return LENINJA_EXT_DIR
+        log_event("ERROR", "leninja extract failed: manifest.json missing")
         return None
     except Exception as e:
-        log_event("ERROR", f"freek download failed: {str(e)[:100]}")
+        log_event("ERROR", f"leninja download failed: {str(e)[:100]}")
         return None
 
 
-async def setup_freek(log_func=None):
+async def check_nopecha_key(key, timeout=8.0):
+    """Return (ok, description). ok is True if key is usable, False otherwise."""
+    url = f"https://api.nopecha.com/status?key={key}"
+
+    async def _do_call():
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            return await client.get(url)
+
+    try:
+        r = await retry_async(_do_call, attempts=2, base_delay=1.5,
+                               label=f"nopecha status", log_retries=False)
+    except Exception as e:
+        return False, f"network error: {str(e)[:80]}"
+    if r.status_code != 200:
+        return False, f"HTTP {r.status_code}: {r.text[:120]}"
+    try:
+        data = r.json()
+    except Exception:
+        return False, f"non-json response: {r.text[:120]}"
+    error = data.get("error")
+    if error:
+        return False, str(error)[:120]
+    plan = data.get("plan") or data.get("subscription") or "?"
+    credit = data.get("credit")
+    if credit is None:
+        credit = data.get("credits")
+    if isinstance(credit, (int, float)) and credit <= 0:
+        return False, f"plan={plan} credit=0 (exhausted)"
+    return True, f"plan={plan} credit={credit if credit is not None else '?'}"
+
+
+async def audit_leninja_keys(log_func=None):
+    """Check every key in config/nopecha.txt in parallel and log per-key status.
+
+    Returns the number of usable keys. When zero, the caller should surface a
+    clear "no CAPTCHA solving will work" warning so the user doesn't spend a
+    long run wondering why hCaptcha keeps re-appearing.
+    """
     _l = log_func or log_event
-    ext_path = download_freek_ext()
-    if not ext_path:
-        _l("ERROR", "Failed to download Freek extension")
-        return None
-    current_key = get_current_freek_key()
-    if current_key:
-        if inject_freek_key(current_key):
-            _l("SUCCESS", "freek key injected")
+    keys = load_leninja_keys()
+    if not keys:
+        return 0
+    results = await asyncio.gather(*(check_nopecha_key(k) for k in keys), return_exceptions=False)
+    alive = 0
+    for k, (ok, desc) in zip(keys, results):
+        masked = (k[:6] + "…" + k[-4:]) if len(k) > 12 else k
+        if ok:
+            _l("SUCCESS", f"nopecha key {masked}: {desc}")
+            alive += 1
         else:
-            _l("WARNING", "freek key could not be injected (check extension files)")
+            _l("WARNING", f"nopecha key {masked}: DEAD ({desc})")
+    return alive
+
+
+async def setup_leninja(log_func=None):
+    _l = log_func or log_event
+    ext_path = download_leninja_ext()
+    if not ext_path:
+        _l("ERROR", "Failed to download LeNinja extension")
+        return None
+    keys = load_leninja_keys()
+    if not keys:
+        _l("WARNING", "no leninja key in config/nopecha.txt - captcha solving will be limited")
+        return ext_path
+    alive = await audit_leninja_keys(_l)
+    if alive == 0:
+        _l("ERROR", f"all {len(keys)} nopecha keys are dead/exhausted - hCaptcha will never solve")
+        _l("ERROR", "  → check balance at https://nopecha.com/manage")
     else:
-        _l("WARNING", "no freek key in config/nopecha.txt - captcha solving will be limited")
+        _l("INFO", f"nopecha keys: {alive}/{len(keys)} usable")
+    current_key = get_current_leninja_key()
+    if current_key:
+        if inject_leninja_key(current_key):
+            _l("SUCCESS", "leninja key injected")
+        else:
+            _l("WARNING", "leninja key could not be injected (check extension files)")
     return ext_path
 
 
 def get_brave_path() -> Optional[str]:
-    paths = [
+    """Legacy shim - callers should prefer find_browser()."""
+    info = find_browser(prefer="brave")
+    return info[1] if info else None
+
+
+BROWSER_CANDIDATES = [
+    # (display name, list of candidate executable paths)
+    ("Brave", [
         r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
         r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
         os.path.expandvars(r"%LOCALAPPDATA%\BraveSoftware\Brave-Browser\Application\brave.exe"),
-    ]
-    for p in paths:
-        if os.path.exists(p):
-            return p
+        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        "/usr/bin/brave-browser",
+        "/usr/bin/brave",
+        "/snap/bin/brave",
+    ]),
+    ("Chrome", [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+    ]),
+    ("Chromium", [
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/snap/bin/chromium",
+        "/opt/pw-browsers/chromium",
+        os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "") + "/chromium",
+    ]),
+    ("Edge", [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        "/usr/bin/microsoft-edge",
+    ]),
+]
+
+
+def find_browser(prefer=None):
+    """Return (browser_name, executable_path) for the first available browser.
+
+    If `prefer` matches one of the candidate names (case-insensitive), that
+    browser is checked first; otherwise the default order (Brave → Chrome →
+    Chromium → Edge) applies. Returns None if nothing is installed.
+    """
+    order = list(BROWSER_CANDIDATES)
+    if prefer:
+        prefer_l = prefer.lower()
+        order.sort(key=lambda entry: 0 if entry[0].lower() == prefer_l else 1)
+    for name, paths in order:
+        for p in paths:
+            if p and os.path.exists(p):
+                return name, p
     return None
 
 
-class GroqCaptchaSolver:
-    def __init__(self, api_key: str):
-        if not GROQ_AVAILABLE:
-            raise ImportError("Groq not installed")
-        self.client = Groq(api_key=api_key)
-        self.model = "llama-3.2-90b-vision-preview"
+def describe_browser_candidates():
+    """Return a human-readable list of the browser install paths we look for."""
+    return "\n".join(f"  {name}: {', '.join(p for p in paths if p)}" for name, paths in BROWSER_CANDIDATES)
 
-    def solve_text_captcha(self, image_base64: str) -> Optional[str]:
+
+try:
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
+
+
+_CAPTCHA_METRICS = {"tries": {}, "wins": {}}
+
+
+class RunMetrics:
+    """Per-run counters + a printable end-of-run summary."""
+
+    def __init__(self):
+        from collections import Counter
+        self.started = time.time()
+        self.attempts = 0
+        self.valid = 0
+        self.locked = 0
+        self.invalid = 0
+        self.total_time = 0.0
+        self.per_provider = {}   # provider name -> {"ok":n, "fail":n}
+        self.per_proxy = {}      # masked proxy -> {"ok":n, "fail":n}
+        self.failure_reasons = Counter()
+
+    def record(self, provider, proxy, outcome, elapsed=0.0, reason=None):
+        """outcome: 'valid', 'locked', or 'invalid'."""
+        self.attempts += 1
+        self.total_time += max(0.0, float(elapsed or 0.0))
+        setattr(self, outcome, getattr(self, outcome) + 1)
+        ok = outcome != "invalid"
+        prov = provider or "?"
+        p_row = self.per_provider.setdefault(prov, {"ok": 0, "fail": 0})
+        p_row["ok" if ok else "fail"] += 1
+        px = _mask_proxy(proxy) if proxy else "direct"
+        px_row = self.per_proxy.setdefault(px, {"ok": 0, "fail": 0})
+        px_row["ok" if ok else "fail"] += 1
+        if not ok and reason:
+            self.failure_reasons[reason] += 1
+
+    def summary_lines(self):
+        elapsed = time.time() - self.started
+        avg = (self.total_time / self.attempts) if self.attempts else 0.0
+        lines = [
+            "",
+            f"{Fore.LIGHTMAGENTA_EX}{'═' * 63}{Style.RESET_ALL}",
+            f"{Fore.LIGHTCYAN_EX}                     RUN SUMMARY{Style.RESET_ALL}",
+            f"{Fore.LIGHTMAGENTA_EX}{'═' * 63}{Style.RESET_ALL}",
+            f"  attempts   : {self.attempts}",
+            f"  {Fore.LIGHTGREEN_EX}valid{Style.RESET_ALL}      : {self.valid}",
+            f"  {Fore.LIGHTYELLOW_EX}locked{Style.RESET_ALL}     : {self.locked}",
+            f"  {Fore.LIGHTRED_EX}invalid{Style.RESET_ALL}    : {self.invalid}",
+            f"  elapsed    : {elapsed:.1f}s (avg per attempt: {avg:.1f}s)",
+        ]
+        if self.per_provider:
+            lines.append(f"  {Fore.LIGHTCYAN_EX}per provider{Style.RESET_ALL} :")
+            for name, row in sorted(self.per_provider.items()):
+                total = row["ok"] + row["fail"]
+                lines.append(f"    {name:<12} {row['ok']}/{total}")
+        if self.per_proxy and self.per_proxy != {"direct": self.per_proxy.get("direct")}:
+            lines.append(f"  {Fore.LIGHTCYAN_EX}per proxy{Style.RESET_ALL}    :")
+            for name, row in sorted(self.per_proxy.items(),
+                                    key=lambda kv: -(kv[1]["ok"] + kv[1]["fail"]))[:10]:
+                total = row["ok"] + row["fail"]
+                lines.append(f"    {name:<30} {row['ok']}/{total}")
+        if self.failure_reasons:
+            lines.append(f"  {Fore.LIGHTCYAN_EX}top failures{Style.RESET_ALL} :")
+            for reason, n in self.failure_reasons.most_common(5):
+                lines.append(f"    {n:>3}x  {reason}")
+        lines.append(f"  {Fore.LIGHTCYAN_EX}captcha{Style.RESET_ALL}      : {captcha_metrics_summary()}")
+        lines.append(f"{Fore.LIGHTMAGENTA_EX}{'═' * 63}{Style.RESET_ALL}")
+        return lines
+
+    def print_summary(self):
+        for line in self.summary_lines():
+            print(line)
+            try:
+                _get_file_logger().info(_strip_ansi(line))
+            except Exception:
+                pass
+
+
+def _record_solver(name, success):
+    _CAPTCHA_METRICS["tries"][name] = _CAPTCHA_METRICS["tries"].get(name, 0) + 1
+    if success:
+        _CAPTCHA_METRICS["wins"][name] = _CAPTCHA_METRICS["wins"].get(name, 0) + 1
+
+
+def captcha_metrics_summary():
+    tries = _CAPTCHA_METRICS["tries"]
+    if not tries:
+        return "no captcha attempts recorded"
+    wins = _CAPTCHA_METRICS["wins"]
+    return " | ".join(f"{n}: {wins.get(n, 0)}/{c}" for n, c in tries.items())
+
+
+class CaptchaSolver:
+    """Base solver: the LeNinja/Nopecha browser extension.
+
+    Discord's CAPTCHA is hCaptcha inside an iframe; the extension solves
+    it invisibly. This solver just waits for the challenge element to
+    disappear (or a hard cap to elapse) and reports success.
+    """
+    name = "extension"
+
+    def __init__(self, wait_seconds=60):
+        self.wait_seconds = wait_seconds
+
+    async def solve(self, page):
+        deadline = time.time() + self.wait_seconds
+        while time.time() < deadline:
+            if not await _captcha_visible(page):
+                _record_solver(self.name, True)
+                return True
+            await asyncio.sleep(0.5)
+        _record_solver(self.name, False)
+        return False
+
+
+class GroqCaptchaSolver(CaptchaSolver):
+    """Groq vision fallback for text CAPTCHAs (rare Discord fallback path)."""
+    name = "groq"
+
+    # Groq deprecates preview model IDs frequently; keep this overridable
+    # from config so users can bump it without editing code.
+    DEFAULT_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+
+    def __init__(self, api_key, wait_seconds=25, model=None):
+        super().__init__(wait_seconds=wait_seconds)
+        self.api_key = (api_key or "").strip()
+        self.model = (model or self.DEFAULT_MODEL).strip()
+        self._client = None
+        if self.api_key and GROQ_AVAILABLE:
+            try:
+                self._client = Groq(api_key=self.api_key)
+            except Exception as e:
+                log_event("WARNING", f"groq init failed: {str(e)[:150]}")
+
+    def available(self):
+        return self._client is not None
+
+    async def solve(self, page):
+        if not self.available():
+            return False
+        img = await _screenshot_captcha(page)
+        if not img:
+            return False
+        text = await asyncio.to_thread(self._solve_sync, img)
+        success = bool(text)
+        _record_solver(self.name, success)
+        if not success:
+            return False
+        return await _submit_text_answer(page, text)
+
+    def _solve_sync(self, image_base64):
         try:
-            resp = self.client.chat.completions.create(
+            resp = self._client.chat.completions.create(
                 model=self.model,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}},
-                            {"type": "text", "text": "Extract ONLY the text from this CAPTCHA."}
-                        ]
-                    }
-                ],
-                temperature=0.1,
-                max_tokens=100
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}},
+                        {"type": "text", "text": "Extract ONLY the text from this CAPTCHA image. Respond with just the characters, nothing else."},
+                    ],
+                }],
+                temperature=0.1, max_tokens=100,
             )
             return resp.choices[0].message.content.strip().replace('"', '').replace('.', '')
-        except:
+        except Exception as e:
+            log_event("WARNING", f"groq solve failed: {str(e)[:150]}")
             return None
+
+
+class ClaudeCaptchaSolver(CaptchaSolver):
+    """Claude vision fallback for text CAPTCHAs."""
+    name = "claude"
+
+    DEFAULT_MODEL = "claude-sonnet-5"
+
+    def __init__(self, api_key, wait_seconds=25, model=None):
+        super().__init__(wait_seconds=wait_seconds)
+        self.api_key = (api_key or "").strip()
+        self.model = (model or self.DEFAULT_MODEL).strip()
+        self._client = None
+        if self.api_key and ANTHROPIC_AVAILABLE:
+            try:
+                self._client = anthropic.Anthropic(api_key=self.api_key)
+            except Exception as e:
+                log_event("WARNING", f"claude init failed: {str(e)[:150]}")
+
+    def available(self):
+        return self._client is not None
+
+    async def solve(self, page):
+        if not self.available():
+            return False
+        img = await _screenshot_captcha(page)
+        if not img:
+            return False
+        text = await asyncio.to_thread(self._solve_sync, img)
+        success = bool(text)
+        _record_solver(self.name, success)
+        if not success:
+            return False
+        return await _submit_text_answer(page, text)
+
+    def _solve_sync(self, image_base64):
+        try:
+            msg = self._client.messages.create(
+                model=self.model,
+                max_tokens=100,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": image_base64}},
+                        {"type": "text", "text": "Extract ONLY the text from this CAPTCHA image. Respond with just the characters, nothing else."},
+                    ],
+                }],
+            )
+            for block in msg.content:
+                if getattr(block, "type", None) == "text":
+                    return block.text.strip().replace('"', '').replace('.', '')
+        except Exception as e:
+            log_event("WARNING", f"claude solve failed: {str(e)[:150]}")
+        return None
+
+
+class CaptchaSolverChain:
+    """Tries each configured solver in order until one succeeds."""
+
+    def __init__(self, solvers):
+        self.solvers = [s for s in solvers if s is not None]
+
+    async def solve(self, page):
+        for solver in self.solvers:
+            if hasattr(solver, "available") and not solver.available():
+                continue
+            log_event("INFO", f"captcha: trying {solver.name} solver")
+            try:
+                if await solver.solve(page):
+                    log_event("SUCCESS", f"captcha solved via {solver.name}")
+                    return True
+            except Exception as e:
+                log_event("WARNING", f"captcha: {solver.name} raised {str(e)[:120]}")
+        log_event("ERROR", "captcha: all solvers exhausted")
+        return False
+
+
+_CAPTCHA_QUERIES = [
+    'iframe[src*="captcha"]',
+    'div[class*="captcha"]',
+    '.h-captcha',
+    '.g-recaptcha',
+    '[data-sitekey]',
+]
+
+
+async def _first_visible_selector(page, queries):
+    """Return the first CSS selector from `queries` that matches a laid-out
+    element with non-zero size and displayable style, or None.
+
+    truedriver's Element has no `is_visible()` and its Tab.evaluate takes
+    only an expression string (no `args=` kwarg), so we inline the query
+    list into the JS and run one round-trip.
+    """
+    try:
+        js = (
+            "(() => { const sels = " + json.dumps(queries) + "; "
+            "for (const s of sels) { const el = document.querySelector(s); if (!el) continue; "
+            "const r = el.getBoundingClientRect(); if (r.width <= 0 || r.height <= 0) continue; "
+            "const st = window.getComputedStyle(el); "
+            "if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') continue; "
+            "return s; } return null; })()"
+        )
+        return await page.evaluate(js)
+    except Exception:
+        return None
+
+
+async def _captcha_visible(page):
+    return bool(await _first_visible_selector(page, _CAPTCHA_QUERIES))
+
+
+async def _screenshot_captcha(page):
+    """Base64-PNG of the visible captcha area, or None if unavailable.
+
+    Best-effort: some challenge iframes are cross-origin and cannot be
+    screenshotted; those fall through and let the next solver try.
+    """
+    try:
+        sel = await _first_visible_selector(page, _CAPTCHA_QUERIES)
+        if sel:
+            el = await page.query_selector(sel)
+            if el:
+                try:
+                    return await el.screenshot_b64()
+                except Exception:
+                    pass
+        return await page.screenshot_b64()
+    except Exception:
+        return None
+
+
+async def _submit_text_answer(page, answer):
+    """Type `answer` into the visible captcha text input and press Enter.
+
+    Only useful for the rare text-CAPTCHA fallback; hCaptcha needs the
+    extension. Returns True if we could locate a text input to send it to.
+    """
+    if not answer:
+        return False
+    sel = await _first_visible_selector(page, [
+        'input[name="captcha"]',
+        'input[aria-label*="captcha" i]',
+        'input[type="text"]',
+    ])
+    if not sel:
+        return False
+    try:
+        el = await page.query_selector(sel)
+        if not el:
+            return False
+        try:
+            await el.send_keys(answer)
+        except Exception:
+            try:
+                await el.set_text(answer)
+            except Exception:
+                return False
+        try:
+            import truedriver.cdp.input_ as cdp_input
+            await page.send(cdp_input.dispatch_key_event(
+                type_="keyDown", key="Enter",
+                windows_virtual_key_code=13, native_virtual_key_code=13))
+            await page.send(cdp_input.dispatch_key_event(
+                type_="keyUp", key="Enter",
+                windows_virtual_key_code=13, native_virtual_key_code=13))
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def build_captcha_chain(cfg):
+    """Assemble the solver chain from config keys.
+
+    Extension is always first. AI solvers only join the chain if their
+    key is present AND their SDK is installed.
+    """
+    solvers = [CaptchaSolver(wait_seconds=int(cfg.get("captcha_extension_wait", 60)))]
+    groq_key = (cfg.get("groq_key") or "").strip()
+    if groq_key:
+        if not GROQ_AVAILABLE:
+            log_event("WARNING", "groq_key set but 'groq' package not installed - skipping")
+        else:
+            solvers.append(GroqCaptchaSolver(groq_key, model=(cfg.get("groq_model") or "").strip() or None))
+    anthropic_key = (cfg.get("anthropic_key") or "").strip()
+    if anthropic_key:
+        if not ANTHROPIC_AVAILABLE:
+            log_event("WARNING", "anthropic_key set but 'anthropic' package not installed - skipping")
+        else:
+            solvers.append(ClaudeCaptchaSolver(anthropic_key, model=(cfg.get("anthropic_model") or "").strip() or None))
+    return CaptchaSolverChain(solvers)
 
 
 JS_UTILS = '''
@@ -425,11 +960,16 @@ def print_stats_bar(valid, locked, invalid):
     print(f"\r {Fore.LIGHTGREEN_EX}Valid: {valid} {Fore.LIGHTBLACK_EX}| {Fore.LIGHTYELLOW_EX}Locked: {locked} {Fore.LIGHTBLACK_EX}| {Fore.LIGHTRED_EX}Invalid: {invalid} {Fore.LIGHTBLACK_EX}| {Fore.LIGHTCYAN_EX}Total: {total}{Style.RESET_ALL}")
 
 
-def set_console_title(title="Freek - Token Generator"):
+def set_console_title(title="LeNinja - Discord EVs Generator"):
     if os.name == 'nt':
         os.system(f"title {title}")
     else:
-        print(f"\33]0;{title}\a", end='', flush=True)
+        try:
+            stream = sys.__stdout__ or sys.stdout
+            stream.write(f"\33]0;{title}\a")
+            stream.flush()
+        except Exception:
+            pass
 
 
 def clear_screen():
@@ -503,14 +1043,14 @@ def show_interface():
     ascii_art = """
 ╔═══════════════════════════════════════════════════════════════╗
 ║                                                               ║
-║   ███████╗██████╗ ███████╗███████╗██╗  ██╗                   ║
-║   ██╔════╝██╔══██╗██╔════╝██╔════╝██║ ██╔╝                   ║
-║   █████╗  ██████╔╝█████╗  █████╗  █████╔╝                    ║
-║   ██╔══╝  ██╔══██╗██╔══╝  ██╔══╝  ██╔═██╗                    ║
-║   ██║     ██║  ██║███████╗███████╗██║  ██╗                   ║
-║   ╚═╝     ╚═╝  ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝                   ║
+║   ██╗     ███████╗███╗   ██╗██╗███╗   ██╗     ██╗ █████╗     ║
+║   ██║     ██╔════╝████╗  ██║██║████╗  ██║     ██║██╔══██╗    ║
+║   ██║     █████╗  ██╔██╗ ██║██║██╔██╗ ██║     ██║███████║    ║
+║   ██║     ██╔══╝  ██║╚██╗██║██║██║╚██╗██║██   ██║██╔══██║    ║
+║   ███████╗███████╗██║ ╚████║██║██║ ╚████║╚█████╔╝██║  ██║    ║
+║   ╚══════╝╚══════╝╚═╝  ╚═══╝╚═╝╚═╝  ╚═══╝ ╚════╝ ╚═╝  ╚═╝    ║
 ║                                                               ║
-║              AI-Powered CAPTCHA Solver v1.0                   ║
+║          Discord EVs Generator · AI CAPTCHA v1.0              ║
 ║                                                               ║
 ╚═══════════════════════════════════════════════════════════════╝
     """
@@ -618,29 +1158,153 @@ def make_handle():
     return name[:32].lower()
 
 
-def load_proxies(config: dict) -> list:
-    proxy_enabled = config.get("proxy", {}).get("enabled", False)
-    if not proxy_enabled:
+def _normalize_proxy(raw):
+    """Accept 'user:pass@host:port', 'host:port:user:pass', 'host:port', or a full URL.
+
+    Returns an http:// URL or None if the line can't be parsed.
+    """
+    line = (raw or "").strip()
+    if not line:
+        return None
+    if "://" in line:
+        return line
+    if "@" in line:
+        return f"http://{line}"
+    parts = line.split(":")
+    if len(parts) == 2:
+        return f"http://{parts[0]}:{parts[1]}"
+    if len(parts) == 4:
+        host, port, user, pw = parts
+        return f"http://{user}:{pw}@{host}:{port}"
+    return None
+
+
+async def _proxy_alive(proxy_url, timeout=5.0):
+    try:
+        async with httpx.AsyncClient(proxy=proxy_url, timeout=timeout) as client:
+            r = await client.get("https://api.ipify.org?format=json")
+            if r.status_code == 200 and "ip" in r.text.lower():
+                return True
+    except Exception:
+        return False
+    return False
+
+
+class ProxyPool:
+    """Round-robin pool with startup health-check and per-use demotion.
+
+    A dead proxy is retired after `max_failures` consecutive strikes; the
+    pool returns None when all proxies are dead so the caller can decide
+    to run direct or abort.
+    """
+
+    def __init__(self, proxies, max_failures=2):
+        self._all = [p for p in (_normalize_proxy(p) for p in proxies) if p]
+        self._alive = list(self._all)
+        self._failures = {p: 0 for p in self._all}
+        self._max_failures = max_failures
+        self._cursor = 0
+        self._lock = threading.Lock()
+
+    def __len__(self):
+        return len(self._alive)
+
+    def size(self):
+        return len(self._all)
+
+    async def health_check(self, concurrency=20):
+        if not self._all:
+            return 0
+        sem = asyncio.Semaphore(concurrency)
+
+        async def check(p):
+            async with sem:
+                return p, await _proxy_alive(p)
+
+        results = await asyncio.gather(*(check(p) for p in self._all), return_exceptions=False)
+        alive = [p for p, ok in results if ok]
+        with self._lock:
+            self._alive = alive
+            self._failures = {p: 0 for p in self._all}
+            self._cursor = 0
+        return len(alive)
+
+    def next(self):
+        with self._lock:
+            if not self._alive:
+                return None
+            proxy = self._alive[self._cursor % len(self._alive)]
+            self._cursor += 1
+            return proxy
+
+    def report_failure(self, proxy):
+        if proxy is None:
+            return
+        with self._lock:
+            self._failures[proxy] = self._failures.get(proxy, 0) + 1
+            if self._failures[proxy] >= self._max_failures and proxy in self._alive:
+                self._alive.remove(proxy)
+                log_event("WARNING", f"proxy retired after {self._failures[proxy]} failures: {_mask_proxy(proxy)}")
+
+    def report_success(self, proxy):
+        if proxy is None:
+            return
+        with self._lock:
+            if proxy in self._failures and self._failures[proxy] > 0:
+                self._failures[proxy] = 0
+
+
+def _mask_proxy(url):
+    if not url:
+        return "-"
+    try:
+        after = url.split("://", 1)[-1]
+        host = after.split("@")[-1]
+        return host
+    except Exception:
+        return url[:40]
+
+
+def load_proxies(config):
+    """Read the proxy file and return the raw list; ProxyPool handles the rest."""
+    proxy_cfg = (config.get("proxy") or {}) if isinstance(config, dict) else {}
+    if not proxy_cfg.get("enabled", False):
         return []
-    proxy_file = config.get("proxy", {}).get("file", "input/proxies.txt")
+    proxy_file = proxy_cfg.get("file", "input/proxies.txt")
     proxy_path = Path(get_path(proxy_file))
     if not proxy_path.exists():
+        log_event("WARNING", f"proxy enabled but file not found: {proxy_path}")
         return []
     try:
-        with open(proxy_path, 'r', encoding='utf-8') as f:
-            proxies = [line.strip() for line in f if line.strip()]
-        if proxies:
-            return proxies
-        else:
-            return []
-    except Exception as e:
+        with open(proxy_path, "r", encoding="utf-8") as f:
+            proxies = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+    except OSError as e:
+        log_event("ERROR", f"could not read proxy file: {e}")
         return []
-
-
-def get_random_proxy(proxies: list) -> str:
     if not proxies:
+        log_event("WARNING", f"proxy file is empty: {proxy_path}")
+    return proxies
+
+
+async def build_proxy_pool(config):
+    raw = load_proxies(config)
+    pool = ProxyPool(raw)
+    if pool.size() == 0:
+        return pool
+    log_event("INFO", f"health-checking {pool.size()} proxy/proxies...")
+    alive = await pool.health_check()
+    log_event("SUCCESS" if alive else "WARNING",
+              f"proxies: {alive}/{pool.size()} alive")
+    return pool
+
+
+def get_random_proxy(proxies_or_pool):
+    """Compat shim: accepts either a list (legacy) or a ProxyPool."""
+    if isinstance(proxies_or_pool, ProxyPool):
+        return proxies_or_pool.next()
+    if not proxies_or_pool:
         return None
-    return random.choice(proxies)
+    return random.choice(proxies_or_pool)
 
 
 MULLVADEXE = None
@@ -877,532 +1541,446 @@ async def rotate_mullvad_ip():
     return new_ip is not None and new_ip != current_ip
 
 
+_DISCORD_VERIFY_PATTERNS = [
+    r'https?://(?:www\.)?discord\.com/verify\?token=[a-zA-Z0-9\-\._~%]+',
+    r'https?://click\.discord\.com/ls/click\?upn=[a-zA-Z0-9\-\._~%]+',
+]
+
+
+def extract_discord_verify_link(content, min_length=50):
+    if not content:
+        return None
+    text = str(content).replace("&amp;", "&").replace("&quot;", '"').replace("&#39;", "'")
+    found = []
+    for pattern in _DISCORD_VERIFY_PATTERNS:
+        for url in re.findall(pattern, text, re.IGNORECASE):
+            url = url.replace("\\/", "/").split("\n")[0].strip()
+            url = re.sub(r"[.,;>]$", "", url)
+            if len(url) > min_length:
+                found.append(url)
+    if not found:
+        return None
+    verify = [u for u in found if "discord.com/verify" in u]
+    (verify or found).sort(key=len, reverse=True)
+    return (verify or found)[0]
+
+
+class MSGraphMailbox:
+    """Base for brokers that hand back Microsoft refresh_tokens.
+
+    Subclasses provide `create_inbox`; the OAuth token refresh and the
+    Graph inbox scan are identical across every Microsoft-backed broker.
+    """
+    ms_client_id = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
+    label = "mailbox"
+
+    def __init__(self):
+        self.email = None
+        self.password = None
+        self.refresh_token = None
+        self.uuid = None
+
+    async def get_access_token(self, r_token=None, c_id=None):
+        token = (r_token or self.refresh_token or "").rstrip("$").strip()
+        cid = (c_id or self.uuid or self.ms_client_id or "").strip()
+        if not token:
+            log_event("ERROR", f"{self.label}: missing refresh_token")
+            return None
+        data = {
+            "client_id": cid,
+            "refresh_token": token,
+            "grant_type": "refresh_token",
+            "scope": "https://graph.microsoft.com/.default",
+        }
+
+        async def _do_call():
+            async with httpx.AsyncClient() as client:
+                return await client.post(
+                    "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+                    data=data, timeout=30,
+                )
+
+        try:
+            r = await retry_async(_do_call, attempts=3, base_delay=1.0,
+                                   label=f"{self.label} oauth", log_retries=True)
+        except Exception as e:
+            log_event("ERROR", f"{self.label}: oauth request failed after retries: {str(e)[:150]}")
+            return None
+        if r.status_code == 200:
+            return r.json().get("access_token")
+        try:
+            err = r.json()
+            msg = err.get("error_description") or err.get("error") or r.text[:200]
+        except Exception:
+            msg = r.text[:200]
+        log_event("ERROR", f"{self.label}: microsoft oauth {r.status_code}: {msg}")
+        return None
+
+    async def get_verification_url(self):
+        if not self.refresh_token:
+            return None
+        access = await self.get_access_token()
+        if not access:
+            return None
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(
+                    "https://graph.microsoft.com/v1.0/me/messages",
+                    headers={"Authorization": f"Bearer {access}"},
+                    params={"$top": 10, "$orderby": "receivedDateTime desc", "$select": "subject,body,from"},
+                    timeout=15,
+                )
+            if r.status_code != 200:
+                log_event("WARNING", f"{self.label}: graph {r.status_code}: {r.text[:150]}")
+                return None
+            for msg in r.json().get("value", []):
+                subj = msg.get("subject", "").lower()
+                from_data = msg.get("from", {}).get("emailAddress", {})
+                frm_addr = from_data.get("address", "").lower()
+                frm_name = from_data.get("name", "").lower()
+                if not (("discord" in frm_addr or "discord" in frm_name)
+                        and ("verify" in subj or "confirm" in subj or "verification" in subj)):
+                    continue
+                body = msg.get("body", {}).get("content", "") or ""
+                link = extract_discord_verify_link(body)
+                if link:
+                    return link
+                for tracked in re.findall(r'https://click\.discord\.com/ls/click\?[^\s"\'><]+', body):
+                    try:
+                        async with httpx.AsyncClient() as check_client:
+                            res = await check_client.get(tracked, follow_redirects=False, timeout=10)
+                            if "discord.com/verify" in res.headers.get("Location", ""):
+                                return tracked
+                    except Exception:
+                        continue
+        except Exception as e:
+            log_event("WARNING", f"{self.label}: graph request failed: {str(e)[:150]}")
+        return None
+
+
+class HydraMailProvider:
+    """Base for API-Platform 'Hydra' style mail brokers (DuckMail, CrowMail)."""
+    api_base = ""
+    label = "mailbox"
+
+    def __init__(self, api_key=None, never_expire=False):
+        self.email = None
+        self.password = None
+        self.api_key = api_key
+        self.auth_token = None
+        self.account_id = None
+        self.never_expire = never_expire
+
+    def _headers(self, content_type=False):
+        h = {}
+        if content_type:
+            h["Content-Type"] = "application/json"
+        if self.api_key:
+            h["Authorization"] = f"Bearer {self.api_key}"
+        return h
+
+    def get_domains(self):
+        try:
+            response = requests.get(f"{self.api_base}/domains", headers=self._headers(), timeout=15, impersonate="chrome124")
+        except Exception as e:
+            log_event("ERROR", f"{self.label}: domains request failed: {str(e)[:150]}")
+            return None
+        if response.status_code != 200:
+            log_event("ERROR", f"{self.label}: domains HTTP {response.status_code}: {response.text[:150]}")
+            return None
+        try:
+            members = response.json().get("hydra:member", []) or []
+        except Exception:
+            log_event("ERROR", f"{self.label}: non-json domains response")
+            return None
+        valid = [item.get("domain") for item in members
+                 if item.get("domain") and item.get("isVerified")
+                 and not is_domain_blacklisted(item.get("domain"))]
+        return valid or None
+
+    async def create_inbox(self, session=None):
+        domains = self.get_domains()
+        if not domains:
+            log_event("ERROR", f"{self.label}: no verified domains available")
+            return None
+        domain = random.choice(domains)
+        user = "".join(random.choices(string.ascii_lowercase + string.digits, k=random.randint(10, 16)))
+        self.email = f"{user}@{domain}"
+        self.password = create_random_string(12)
+
+        payload = {
+            "address": self.email,
+            "password": self.password,
+            "expiresIn": 0 if self.never_expire else 86400,
+        }
+        try:
+            create_resp = requests.post(
+                f"{self.api_base}/accounts",
+                headers=self._headers(content_type=True),
+                json=payload, timeout=15, impersonate="chrome124",
+            )
+        except Exception as e:
+            log_event("ERROR", f"{self.label}: account create failed: {str(e)[:150]}")
+            return None
+        if create_resp.status_code not in (200, 201):
+            log_event("ERROR", f"{self.label}: account create HTTP {create_resp.status_code}: {create_resp.text[:200]}")
+            return None
+
+        try:
+            token_resp = requests.post(
+                f"{self.api_base}/token",
+                headers={"Content-Type": "application/json"},
+                json={"address": self.email, "password": self.password},
+                timeout=15, impersonate="chrome124",
+            )
+        except Exception as e:
+            log_event("ERROR", f"{self.label}: token request failed: {str(e)[:150]}")
+            return None
+        if token_resp.status_code == 200:
+            td = token_resp.json()
+            self.auth_token = td.get("token")
+            self.account_id = td.get("id")
+        else:
+            log_event("WARNING", f"{self.label}: token HTTP {token_resp.status_code}: {token_resp.text[:150]}")
+        return self.email
+
+    async def get_verification_url(self):
+        if not self.auth_token:
+            return None
+        headers = {"Authorization": f"Bearer {self.auth_token}"}
+        try:
+            for _ in range(3):
+                response = requests.get(f"{self.api_base}/messages", headers=headers, timeout=15, impersonate="chrome124")
+                if response.status_code == 200:
+                    messages = response.json().get("hydra:member", []) or []
+                    if isinstance(messages, list):
+                        for mail in messages:
+                            subject = str(mail.get("subject", "") or "").lower()
+                            from_data = mail.get("from", {}) or {}
+                            from_address = str(from_data.get("address", "") or "").lower()
+                            from_name = str(from_data.get("name", "") or "").lower()
+                            is_discord = "discord" in from_address or "discord" in from_name
+                            has_verify = "verify" in subject or "confirm" in subject or "verification" in subject
+                            if not (is_discord or has_verify):
+                                continue
+                            msg_id = mail.get("id")
+                            if not msg_id:
+                                continue
+                            detail_resp = requests.get(f"{self.api_base}/messages/{msg_id}", headers=headers, timeout=15, impersonate="chrome124")
+                            if detail_resp.status_code != 200:
+                                continue
+                            msg_detail = detail_resp.json()
+                            parts = [str(msg_detail.get("text", "") or "")]
+                            for html_body in (msg_detail.get("html", []) or []):
+                                parts.append(str(html_body or ""))
+                            link = extract_discord_verify_link("\n".join(parts))
+                            if link:
+                                return link
+                await asyncio.sleep(1)
+        except Exception as e:
+            log_event("WARNING", f"{self.label}: verify scan failed: {str(e)[:150]}")
+        return None
+
+
 class MailboxClient:
     def __init__(self, api_token):
         self.email = None
         self.api_base = "https://api.cybertemp.xyz"
-        self.token = api_token
+        self.token = (api_token or "").strip()
         self.domain = None
         self.password = None
 
     async def get_domain(self):
         try:
-            headers = {"X-API-KEY": self.token}
-            params = {"type": "discord", "limit": 20}
             async with httpx.AsyncClient() as session:
-                response = await session.get(f"{self.api_base}/getDomains", headers=headers, params=params)
-                if response.status_code == 200:
-                    data = response.json()
-                    if data:
-                        excluded = ["altmails.icu"]
-                        filtered = [d for d in data if not d.endswith('.store') and not d.endswith('.ng') and d not in excluded]
-                        if filtered:
-                            return random.choice(filtered)
-                        return random.choice([d for d in data if d not in excluded]) if any(d not in excluded for d in data) else "cybertemp.xyz"
-        except:
-            pass
-        return "cybertemp.xyz"
+                response = await session.get(
+                    f"{self.api_base}/getDomains",
+                    headers={"X-API-KEY": self.token},
+                    params={"type": "discord", "limit": 20},
+                    timeout=15,
+                )
+            if response.status_code != 200:
+                log_event("WARNING", f"cybertemp: getDomains {response.status_code}: {response.text[:150]}")
+                return "cybertemp.xyz"
+            data = response.json() or []
+            excluded = {"altmails.icu"}
+            filtered = [d for d in data if not d.endswith(".store") and not d.endswith(".ng") and d not in excluded]
+            if filtered:
+                return random.choice(filtered)
+            usable = [d for d in data if d not in excluded]
+            return random.choice(usable) if usable else "cybertemp.xyz"
+        except Exception as e:
+            log_event("WARNING", f"cybertemp: getDomains failed: {str(e)[:150]}")
+            return "cybertemp.xyz"
 
     async def create_inbox(self):
-        try:
-            self.domain = await self.get_domain()
-            user = ''.join(random.choices(string.ascii_lowercase + string.digits, k=random.randint(14, 18)))
-            self.email = f"{user}@{self.domain}"
-            self.password = create_random_string(12)
-            return self.email
-        except:
-            pass
-        return None
+        if not self.token:
+            log_event("ERROR", "cybertemp: no api key set (config/config.yaml -> cybertemp_key)")
+            return None
+        self.domain = await self.get_domain()
+        user = "".join(random.choices(string.ascii_lowercase + string.digits, k=random.randint(14, 18)))
+        self.email = f"{user}@{self.domain}"
+        self.password = create_random_string(12)
+        return self.email
 
     async def get_verification_url(self):
         if not self.email:
             return None
-        headers = {"X-API-KEY": self.token}
-        params = {"email": self.email, "limit": 5}
-        async with httpx.AsyncClient() as session:
-            try:
-                response = await session.get(f"{self.api_base}/getMail", headers=headers, params=params, timeout=15)
-                if response.status_code == 200:
-                    emails = response.json()
-                    if isinstance(emails, list):
-                        for mail in emails:
-                            content = mail.get('html', '') or mail.get('text', '')
-                            subj = mail.get('subject', '')
-                            if "verify" in subj.lower() or "discord" in subj.lower():
-                                patterns = [
-                                    r'https?://click\.discord\.com/ls/click\?upn=[a-zA-Z0-9\-\._~%]+',
-                                    r'https?://discord\.com/verify\?token=[a-zA-Z0-9\-\._~%]+'
-                                ]
-                                links = []
-                                for pattern in patterns:
-                                    matches = re.findall(pattern, content)
-                                    for match in matches:
-                                        url = match.replace('\\/', '/').split("\n")[0].strip()
-                                        url = url.replace('&amp;', '&')
-                                        if "click.discord.com/ls/click?upn=" in url or "discord.com/verify?token=" in url:
-                                            if len(url) > 50:
-                                                links.append(url)
-                                if links:
-                                    links.sort(key=len, reverse=True)
-                                    return links[0]
-            except Exception:
-                pass
-        return None
-
-class Hotmail007Provider:
-    def __init__(self, client_key, mail_type="hotmail"):
-        self.client_key = client_key
-        self.mail_type = mail_type
-        self.email = None
-        self.password = None
-        self.refresh_token = None
-        self.uuid = None
-        self.base_api = "https://gapi.hotmail007.com/api"
-        self.ms_client_id = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
-
-    async def get_access_token(self, r_token=None, c_id=None):
         try:
-            token = (r_token or self.refresh_token).rstrip("$")
-            cid = c_id or self.uuid or self.ms_client_id
-            url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
-            data = {
-                "client_id": cid,
-                "refresh_token": token,
-                "grant_type": "refresh_token",
-                "scope": "https://graph.microsoft.com/.default"
-            }
-            async with httpx.AsyncClient() as client:
-                r = await client.post(url, data=data, timeout=30)
-                if r.status_code == 200:
-                    return r.json().get("access_token")
-        except:
-            pass
+            async with httpx.AsyncClient() as session:
+                response = await session.get(
+                    f"{self.api_base}/getMail",
+                    headers={"X-API-KEY": self.token},
+                    params={"email": self.email, "limit": 5},
+                    timeout=15,
+                )
+            if response.status_code != 200:
+                log_event("WARNING", f"cybertemp: getMail {response.status_code}: {response.text[:150]}")
+                return None
+            emails = response.json()
+            if not isinstance(emails, list):
+                return None
+            for mail in emails:
+                subj = str(mail.get("subject", "") or "").lower()
+                if "verify" not in subj and "discord" not in subj:
+                    continue
+                content = mail.get("html", "") or mail.get("text", "")
+                link = extract_discord_verify_link(content)
+                if link:
+                    return link
+        except Exception as e:
+            log_event("WARNING", f"cybertemp: getMail failed: {str(e)[:150]}")
         return None
+
+def _parse_broker_credential(raw, default_client_id):
+    """Parse an 'email:password:refresh_token[:client_id]' record from a broker.
+
+    Splits at most 3 times so that a password containing ':' is not corrupted,
+    strips whitespace/BOM, and falls back to `default_client_id` when the
+    broker omits the client id.
+    """
+    if raw is None:
+        return None
+    text = (raw if isinstance(raw, str) else str(raw)).strip().lstrip("﻿")
+    parts = text.split(":", 3)
+    if len(parts) < 3:
+        return None
+    email = parts[0].strip()
+    password = parts[1].strip()
+    refresh_token = parts[2].strip()
+    client_id = parts[3].strip() if len(parts) >= 4 and parts[3].strip() else default_client_id
+    return email, password, refresh_token, client_id
+
+
+class Hotmail007Provider(MSGraphMailbox):
+    label = "hotmail007"
+
+    def __init__(self, client_key, mail_type="hotmail"):
+        super().__init__()
+        self.client_key = (client_key or "").strip()
+        self.mail_type = mail_type
+        self.base_api = "https://gapi.hotmail007.com/api"
 
     async def create_inbox(self):
+        if not self.client_key:
+            log_event("ERROR", "hotmail007: no api key set (config/config.yaml -> hotmail007_key)")
+            return None
         url = f"{self.base_api}/mail/getMail?clientKey={self.client_key}&mailType={self.mail_type}&quantity=1"
         try:
             async with httpx.AsyncClient() as client:
                 r = await client.get(url, timeout=30)
-                if r.status_code == 200:
-                    data = r.json()
-                    if data.get("code") == 0 and data.get("success"):
-                        accounts = data.get("data", [])
-                        if accounts:
-                            parts = accounts[0].split(":")
-                            if len(parts) >= 4:
-                                self.email = parts[0].strip()
-                                self.password = parts[1].strip()
-                                self.refresh_token = parts[2].strip()
-                                self.uuid = parts[3].strip()
-                                return self.email
-                        else:
-                            pass
-                    else:
-                        pass
-                else:
-                    pass
         except Exception as e:
-            pass
-        return None
-
-    async def get_verification_url(self):
-        if not self.refresh_token:
+            log_event("ERROR", f"hotmail007: network error: {str(e)[:150]}")
             return None
-        access = await self.get_access_token()
-        if not access:
+        if r.status_code != 200:
+            log_event("ERROR", f"hotmail007: HTTP {r.status_code}: {r.text[:200]}")
             return None
         try:
-            async with httpx.AsyncClient() as client:
-                r = await client.get(
-                    "https://graph.microsoft.com/v1.0/me/messages",
-                    headers={"Authorization": f"Bearer {access}"},
-                    params={"$top": 10, "$orderby": "receivedDateTime desc", "$select": "subject,body,from"},
-                    timeout=15
-                )
-                if r.status_code == 200:
-                    for msg in r.json().get("value", []):
-                        subj = msg.get("subject", "").lower()
-                        from_data = msg.get("from", {}).get("emailAddress", {})
-                        frm_addr = from_data.get("address", "").lower()
-                        frm_name = from_data.get("name", "").lower()
-                        is_discord = "discord" in frm_addr or "discord" in frm_name
-                        has_verify = "verify" in subj or "confirm" in subj or "verification" in subj
-                        if is_discord and has_verify:
-                            body = msg.get("body", {}).get("content", "")
-                            body = body.replace("&amp;", "&").replace("&quot;", '"').replace("&#39;", "'")
-                            matches = re.findall(r'https://discord\.com/verify\?token=[^\s"\'><]+', body)
-                            if matches:
-                                return matches[0]
-                            tracked_links = re.findall(r'https://click\.discord\.com/ls/click\?[^\s"\'><]+', body)
-                            for link in tracked_links:
-                                try:
-                                    async with httpx.AsyncClient() as check_client:
-                                        res = await check_client.get(link, follow_redirects=False, timeout=10)
-                                        target = res.headers.get("Location", "")
-                                        if "discord.com/verify" in target:
-                                            return link
-                                except Exception:
-                                    continue
+            data = r.json()
         except Exception:
-            pass
-        return None
+            log_event("ERROR", f"hotmail007: non-json response: {r.text[:200]}")
+            return None
+        if data.get("code") != 0 or not data.get("success"):
+            msg = data.get("msg") or data.get("message") or data.get("error") or str(data)[:200]
+            log_event("ERROR", f"hotmail007: api error (code={data.get('code')}): {msg}")
+            return None
+        accounts = data.get("data") or []
+        if not accounts:
+            log_event("ERROR", "hotmail007: api returned empty account list (check balance / stock)")
+            return None
+        parsed = _parse_broker_credential(accounts[0], self.ms_client_id)
+        if not parsed:
+            log_event("ERROR", f"hotmail007: unexpected account format: {str(accounts[0])[:80]}")
+            return None
+        self.email, self.password, self.refresh_token, self.uuid = parsed
+        return self.email
 
 
-class ZeusXProvider:
+class ZeusXProvider(MSGraphMailbox):
+    label = "zeus-x"
+
     def __init__(self, api_key, account_code="HOTMAIL"):
-        self.api_key = api_key
+        super().__init__()
+        self.api_key = (api_key or "").strip()
         self.account_code = account_code
-        self.email = None
-        self.password = None
-        self.refresh_token = None
-        self.uuid = None
         self.base_api = "https://api.zeus-x.ru"
-        self.ms_client_id = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
-
-    async def get_access_token(self, r_token=None, c_id=None):
-        try:
-            token = (r_token or self.refresh_token).rstrip("$")
-            cid = c_id or self.uuid or self.ms_client_id
-            url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
-            data = {
-                "client_id": cid,
-                "refresh_token": token,
-                "grant_type": "refresh_token",
-                "scope": "https://graph.microsoft.com/.default"
-            }
-            async with httpx.AsyncClient() as client:
-                r = await client.post(url, data=data, timeout=30)
-                if r.status_code == 200:
-                    return r.json().get("access_token")
-        except:
-            pass
-        return None
 
     async def create_inbox(self):
+        if not self.api_key:
+            log_event("ERROR", "zeus-x: no api key set (config/config.yaml -> zeusx_key)")
+            return None
         url = f"{self.base_api}/purchase?apikey={self.api_key}&accountcode={self.account_code}&quantity=1"
         try:
             async with httpx.AsyncClient() as client:
                 r = await client.get(url, timeout=30)
-                if r.status_code == 200:
-                    data = r.json()
-                    accounts = data.get("data", [])
-                    if not accounts and isinstance(data, list):
-                        accounts = data
-                    
-                    if accounts:
-                        parts = accounts[0].split(":")
-                        if len(parts) >= 4:
-                            self.email = parts[0].strip()
-                            self.password = parts[1].strip()
-                            self.refresh_token = parts[2].strip()
-                            self.uuid = parts[3].strip()
-                            return self.email
-                        elif len(parts) >= 3:
-                            self.email = parts[0].strip()
-                            self.password = parts[1].strip()
-                            self.refresh_token = parts[2].strip()
-                            return self.email
+        except Exception as e:
+            log_event("ERROR", f"zeus-x: network error: {str(e)[:150]}")
+            return None
+        if r.status_code != 200:
+            log_event("ERROR", f"zeus-x: HTTP {r.status_code}: {r.text[:200]}")
+            return None
+        try:
+            data = r.json()
         except Exception:
-            pass
-        return None
-
-    async def get_verification_url(self):
-        if not self.refresh_token:
+            log_event("ERROR", f"zeus-x: non-json response: {r.text[:200]}")
             return None
-        access = await self.get_access_token()
-        if not access:
+        if isinstance(data, list):
+            accounts = data
+        else:
+            accounts = data.get("data") or []
+        if not accounts:
+            log_event("ERROR", "zeus-x: api returned empty account list (check balance / stock)")
             return None
-        try:
-            async with httpx.AsyncClient() as client:
-                r = await client.get(
-                    "https://graph.microsoft.com/v1.0/me/messages",
-                    headers={"Authorization": f"Bearer {access}"},
-                    params={"$top": 10, "$orderby": "receivedDateTime desc", "$select": "subject,body,from"},
-                    timeout=15
-                )
-                if r.status_code == 200:
-                    for msg in r.json().get("value", []):
-                        subj = msg.get("subject", "").lower()
-                        from_data = msg.get("from", {}).get("emailAddress", {})
-                        frm_addr = from_data.get("address", "").lower()
-                        frm_name = from_data.get("name", "").lower()
-                        is_discord = "discord" in frm_addr or "discord" in frm_name
-                        has_verify = "verify" in subj or "confirm" in subj or "verification" in subj
-                        if is_discord and has_verify:
-                            body = msg.get("body", {}).get("content", "")
-                            body = body.replace("&amp;", "&").replace("&quot;", '"').replace("&#39;", "'")
-                            matches = re.findall(r'https://discord\.com/verify\?token=[^\s"\'><]+', body)
-                            if matches:
-                                return matches[0]
-                            tracked_links = re.findall(r'https://click\.discord\.com/ls/click\?[^\s"\'><]+', body)
-                            for link in tracked_links:
-                                try:
-                                    async with httpx.AsyncClient() as check_client:
-                                        res = await check_client.get(link, follow_redirects=False, timeout=10)
-                                        target = res.headers.get("Location", "")
-                                        if "discord.com/verify" in target:
-                                            return link
-                                except Exception:
-                                    continue
-        except Exception:
-            pass
-        return None
-
-
-class DuckMailProvider:
-    def __init__(self, api_key=None, never_expire=False):
-        self.email = None
-        self.password = None
-        self.api_base = "https://api.duckmail.sbs"
-        self.api_key = api_key
-        self.auth_token = None
-        self.account_id = None
-        self.never_expire = never_expire
-
-    def get_domains(self):
-        try:
-            headers = {}
-            if self.api_key:
-                headers["Authorization"] = f"Bearer {self.api_key}"
-            response = requests.get(f"{self.api_base}/domains", headers=headers, timeout=15, impersonate="chrome124")
-            if response.status_code == 200:
-                data = response.json()
-                members = data.get("hydra:member", [])
-                valid_domains = []
-                for item in members:
-                    domain = item.get("domain")
-                    if domain and item.get("isVerified") and not is_domain_blacklisted(domain):
-                        valid_domains.append(domain)
-                if valid_domains:
-                    return valid_domains
-        except:
-            pass
-        return None
-
-    async def create_inbox(self, session=None):
-        try:
-            domains = self.get_domains()
-            if not domains:
-                return None
-            domain = random.choice(domains)
-            user = "".join(random.choices(string.ascii_lowercase + string.digits, k=random.randint(10, 16)))
-            self.email = f"{user}@{domain}"
-            self.password = create_random_string(12)
-
-            headers = {"Content-Type": "application/json"}
-            if self.api_key:
-                headers["Authorization"] = f"Bearer {self.api_key}"
-            payload = {
-                "address": self.email,
-                "password": self.password,
-                "expiresIn": 0 if self.never_expire else 86400,
-            }
-            create_resp = requests.post(f"{self.api_base}/accounts", headers=headers, json=payload, timeout=15, impersonate="chrome124")
-            if create_resp.status_code not in [200, 201]:
-                return None
-
-            token_payload = {"address": self.email, "password": self.password}
-            token_resp = requests.post(f"{self.api_base}/token", headers={"Content-Type": "application/json"}, json=token_payload, timeout=15, impersonate="chrome124")
-            if token_resp.status_code == 200:
-                token_data = token_resp.json()
-                self.auth_token = token_data.get("token")
-                self.account_id = token_data.get("id")
-            return self.email
-        except:
-            pass
-        return None
-
-    async def get_verification_url(self):
-        if not self.auth_token:
+        parsed = _parse_broker_credential(accounts[0], self.ms_client_id)
+        if not parsed:
+            log_event("ERROR", f"zeus-x: unexpected account format: {str(accounts[0])[:80]}")
             return None
-        headers = {"Authorization": f"Bearer {self.auth_token}"}
-        try:
-            for _ in range(3):
-                response = requests.get(f"{self.api_base}/messages", headers=headers, timeout=15, impersonate="chrome124")
-                if response.status_code == 200:
-                    data = response.json()
-                    messages = data.get("hydra:member", [])
-                    if isinstance(messages, list):
-                        for mail in messages:
-                            subject = str(mail.get("subject", "") or "").lower()
-                            from_data = mail.get("from", {}) or {}
-                            from_address = str(from_data.get("address", "") or "").lower()
-                            from_name = str(from_data.get("name", "") or "").lower()
-                            is_discord = "discord" in from_address or "discord" in from_name
-                            has_verify = "verify" in subject or "confirm" in subject or "verification" in subject
-                            if is_discord or has_verify:
-                                msg_id = mail.get("id")
-                                if msg_id:
-                                    detail_resp = requests.get(f"{self.api_base}/messages/{msg_id}", headers=headers, timeout=15, impersonate="chrome124")
-                                    if detail_resp.status_code == 200:
-                                        msg_detail = detail_resp.json()
-                                        content_parts = []
-                                        text_body = str(msg_detail.get("text", "") or "")
-                                        if text_body:
-                                            content_parts.append(text_body)
-                                        html_bodies = msg_detail.get("html", []) or []
-                                        for html_body in html_bodies:
-                                            content_parts.append(str(html_body or ""))
-                                        full_content = "\n".join(content_parts)
-                                        patterns = [
-                                            r'https?://(?:www\.)?discord\.com/verify\?token=[a-zA-Z0-9\-\._~%]+',
-                                            r'https?://click\.discord\.com/ls/click\?upn=[a-zA-Z0-9\-\._~%]+',
-                                        ]
-                                        found_links = []
-                                        for pattern in patterns:
-                                            matches = re.findall(pattern, full_content, re.IGNORECASE)
-                                            for url in matches:
-                                                url = url.replace("\\/", "/").split("\n")[0].strip().replace("&amp;", "&")
-                                                url = re.sub(r"[.,;>]$", "", url)
-                                                if len(url) > 50:
-                                                    found_links.append(url)
-                                        if found_links:
-                                            verify_links = [link for link in found_links if "discord.com/verify" in link]
-                                            if verify_links:
-                                                verify_links.sort(key=len, reverse=True)
-                                                return verify_links[0]
-                                            found_links.sort(key=len, reverse=True)
-                                            return found_links[0]
-                await asyncio.sleep(1)
-        except:
-            pass
-        return None
+        self.email, self.password, self.refresh_token, self.uuid = parsed
+        return self.email
 
 
-class CrowMailProvider:
-    def __init__(self, api_key=None, never_expire=False):
-        self.email = None
-        self.password = None
-        self.api_base = "https://api.crowmail.sbs"
-        self.api_key = api_key
-        self.auth_token = None
-        self.account_id = None
-        self.never_expire = never_expire
+class DuckMailProvider(HydraMailProvider):
+    label = "duckmail"
+    api_base = "https://api.duckmail.sbs"
 
-    def get_domains(self):
-        try:
-            headers = {}
-            if self.api_key:
-                headers["Authorization"] = f"Bearer {self.api_key}"
-            response = requests.get(f"{self.api_base}/domains", headers=headers, timeout=15, impersonate="chrome124")
-            if response.status_code == 200:
-                data = response.json()
-                members = data.get("hydra:member", [])
-                valid_domains = []
-                for item in members:
-                    domain = item.get("domain")
-                    if domain and item.get("isVerified") and not is_domain_blacklisted(domain):
-                        valid_domains.append(domain)
-                if valid_domains:
-                    return valid_domains
-        except:
-            pass
-        return None
 
-    async def create_inbox(self, session=None):
-        try:
-            domains = self.get_domains()
-            if not domains:
-                return None
-            domain = random.choice(domains)
-            user = "".join(random.choices(string.ascii_lowercase + string.digits, k=random.randint(10, 16)))
-            self.email = f"{user}@{domain}"
-            self.password = create_random_string(12)
-
-            headers = {"Content-Type": "application/json"}
-            if self.api_key:
-                headers["Authorization"] = f"Bearer {self.api_key}"
-            payload = {
-                "address": self.email,
-                "password": self.password,
-                "expiresIn": 0 if self.never_expire else 86400,
-            }
-            create_resp = requests.post(f"{self.api_base}/accounts", headers=headers, json=payload, timeout=15, impersonate="chrome124")
-            if create_resp.status_code not in [200, 201]:
-                return None
-
-            token_payload = {"address": self.email, "password": self.password}
-            token_resp = requests.post(f"{self.api_base}/token", headers={"Content-Type": "application/json"}, json=token_payload, timeout=15, impersonate="chrome124")
-            if token_resp.status_code == 200:
-                token_data = token_resp.json()
-                self.auth_token = token_data.get("token")
-                self.account_id = token_data.get("id")
-            return self.email
-        except:
-            pass
-        return None
-
-    async def get_verification_url(self):
-        if not self.auth_token:
-            return None
-        headers = {"Authorization": f"Bearer {self.auth_token}"}
-        try:
-            for _ in range(3):
-                response = requests.get(f"{self.api_base}/messages", headers=headers, timeout=15, impersonate="chrome124")
-                if response.status_code == 200:
-                    data = response.json()
-                    messages = data.get("hydra:member", [])
-                    if isinstance(messages, list):
-                        for mail in messages:
-                            subject = str(mail.get("subject", "") or "").lower()
-                            from_data = mail.get("from", {}) or {}
-                            from_address = str(from_data.get("address", "") or "").lower()
-                            from_name = str(from_data.get("name", "") or "").lower()
-                            is_discord = "discord" in from_address or "discord" in from_name
-                            has_verify = "verify" in subject or "confirm" in subject or "verification" in subject
-                            if is_discord or has_verify:
-                                msg_id = mail.get("id")
-                                if msg_id:
-                                    detail_resp = requests.get(f"{self.api_base}/messages/{msg_id}", headers=headers, timeout=15, impersonate="chrome124")
-                                    if detail_resp.status_code == 200:
-                                        msg_detail = detail_resp.json()
-                                        content_parts = []
-                                        text_body = str(msg_detail.get("text", "") or "")
-                                        if text_body:
-                                            content_parts.append(text_body)
-                                        html_bodies = msg_detail.get("html", []) or []
-                                        for html_body in html_bodies:
-                                            content_parts.append(str(html_body or ""))
-                                        full_content = "\n".join(content_parts)
-                                        patterns = [
-                                            r'https?://(?:www\.)?discord\.com/verify\?token=[a-zA-Z0-9\-\._~%]+',
-                                            r'https?://click\.discord\.com/ls/click\?upn=[a-zA-Z0-9\-\._~%]+',
-                                        ]
-                                        found_links = []
-                                        for pattern in patterns:
-                                            matches = re.findall(pattern, full_content, re.IGNORECASE)
-                                            for url in matches:
-                                                url = url.replace("\\/", "/").split("\n")[0].strip().replace("&amp;", "&")
-                                                url = re.sub(r"[.,;>]$", "", url)
-                                                if len(url) > 50:
-                                                    found_links.append(url)
-                                        if found_links:
-                                            verify_links = [link for link in found_links if "discord.com/verify" in link]
-                                            if verify_links:
-                                                verify_links.sort(key=len, reverse=True)
-                                                return verify_links[0]
-                                            found_links.sort(key=len, reverse=True)
-                                            return found_links[0]
-                await asyncio.sleep(1)
-        except:
-            pass
-        return None
+class CrowMailProvider(HydraMailProvider):
+    label = "crowmail"
+    api_base = "https://api.crowmail.sbs"
 
 
 class AfhamMailProvider:
+    label = "afham"
+
     def __init__(self, api_key="axm_moOcVCBUD6r1FbIeThT0wEmEofjuaDnJdMiQj7OymTU"):
-        self.api_key = api_key
+        self.api_key = (api_key or "").strip()
         self.api_base = "https://api.afhamxmailz.com"
         self.email = None
         self.inbox_id = None
         self.password = None
 
     def _headers(self):
-        return {
-            "X-API-Key": self.api_key,
-            "Content-Type": "application/json",
-        }
+        return {"X-API-Key": self.api_key, "Content-Type": "application/json"}
 
     async def get_discord_domain(self):
         try:
@@ -1413,35 +1991,40 @@ class AfhamMailProvider:
                     params={"type": "discord"},
                     timeout=15,
                 )
-                if response.status_code == 200:
-                    data = response.json()
-                    if isinstance(data, list):
-                        valid = [
-                            d["domain"] for d in data
-                            if isinstance(d, dict)
-                            and d.get("status") == "active"
-                            and not d.get("domain", "").endswith(".store")
-                            and not d.get("domain", "").endswith(".ng")
-                        ]
-                        if valid:
-                            return random.choice(valid)
-        except:
-            pass
-        return None
+        except Exception as e:
+            log_event("ERROR", f"afham: domains request failed: {str(e)[:150]}")
+            return None
+        if response.status_code != 200:
+            log_event("ERROR", f"afham: domains HTTP {response.status_code}: {response.text[:150]}")
+            return None
+        try:
+            data = response.json()
+        except Exception:
+            log_event("ERROR", "afham: non-json domains response")
+            return None
+        if not isinstance(data, list):
+            log_event("ERROR", "afham: unexpected domains response shape")
+            return None
+        valid = [
+            d["domain"] for d in data
+            if isinstance(d, dict)
+            and d.get("status") == "active"
+            and not d.get("domain", "").endswith(".store")
+            and not d.get("domain", "").endswith(".ng")
+        ]
+        if not valid:
+            log_event("ERROR", "afham: no active discord-safe domains available")
+            return None
+        return random.choice(valid)
 
     async def create_inbox(self):
+        domain = await self.get_discord_domain()
+        if not domain:
+            return None
+        user = "".join(random.choices(string.ascii_lowercase + string.digits, k=random.randint(10, 16)))
+        self.password = create_random_string(12)
+        payload = {"username": user, "domain": domain, "password": self.password}
         try:
-            domain = await self.get_discord_domain()
-            if not domain:
-                return None
-
-            user = "".join(random.choices(string.ascii_lowercase + string.digits, k=random.randint(10, 16)))
-            self.password = create_random_string(12)
-            payload = {
-                "username": user,
-                "domain": domain,
-                "password": self.password,
-            }
             async with httpx.AsyncClient() as session:
                 response = await session.post(
                     f"{self.api_base}/inbox/generate",
@@ -1450,14 +2033,16 @@ class AfhamMailProvider:
                     params={"type": "discord"},
                     timeout=15,
                 )
-                if response.status_code in [200, 201]:
-                    data = response.json()
-                    self.email = data.get("address")
-                    self.inbox_id = data.get("id")
-                    return self.email
-        except:
-            pass
-        return None
+        except Exception as e:
+            log_event("ERROR", f"afham: inbox create failed: {str(e)[:150]}")
+            return None
+        if response.status_code not in (200, 201):
+            log_event("ERROR", f"afham: inbox create HTTP {response.status_code}: {response.text[:200]}")
+            return None
+        data = response.json()
+        self.email = data.get("address")
+        self.inbox_id = data.get("id")
+        return self.email
 
     async def get_verification_url(self):
         if not self.email:
@@ -1475,7 +2060,6 @@ class AfhamMailProvider:
                     data = response.json()
                     if isinstance(data, list):
                         emails = data
-
                 if not emails:
                     response = await session.get(
                         f"{self.api_base}/emails/{self.email}",
@@ -1487,7 +2071,7 @@ class AfhamMailProvider:
                         data = response.json()
                         emails = data.get("emails", []) if isinstance(data, dict) else data
 
-                for mail in emails:
+                for mail in emails or []:
                     subject = str(mail.get("subject", "") or "").lower()
                     from_address = str(mail.get("from_address", "") or "").lower()
                     from_name = str(mail.get("from_name", "") or "").lower()
@@ -1495,64 +2079,44 @@ class AfhamMailProvider:
                     has_verify = "verify" in subject or "confirm" in subject or "verification" in subject
                     if not (is_discord or has_verify):
                         continue
-
                     msg_id = mail.get("id")
                     if not msg_id:
                         continue
-
                     detail_resp = await session.get(
                         f"{self.api_base}/emails/message/{msg_id}",
-                        headers=self._headers(),
-                        timeout=15,
+                        headers=self._headers(), timeout=15,
                     )
                     if detail_resp.status_code != 200:
                         continue
-
                     msg = detail_resp.json()
-                    full_content = (
-                        str(msg.get("body_text", "") or "") + "\n" +
-                        str(msg.get("body_html", "") or "")
-                    ).replace("&amp;", "&")
-
-                    patterns = [
-                        r'https?://(?:www\.)?discord\.com/verify\?token=[a-zA-Z0-9\-\._~%]+',
-                        r'https?://click\.discord\.com/ls/click\?upn=[a-zA-Z0-9\-\._~%]+',
-                    ]
-                    links = []
-                    for pattern in patterns:
-                        for url in re.findall(pattern, full_content, re.IGNORECASE):
-                            url = url.replace("\\/", "/").split("\n")[0].strip()
-                            url = re.sub(r"[.,;>]$", "", url)
-                            if len(url) > 50:
-                                links.append(url)
-
-                    if links:
-                        verify_links = [l for l in links if "discord.com/verify" in l]
-                        if verify_links:
-                            verify_links.sort(key=len, reverse=True)
-                            return verify_links[0]
-                        links.sort(key=len, reverse=True)
-                        return links[0]
-        except:
-            pass
+                    body = str(msg.get("body_text", "") or "") + "\n" + str(msg.get("body_html", "") or "")
+                    link = extract_discord_verify_link(body)
+                    if link:
+                        return link
+        except Exception as e:
+            log_event("WARNING", f"afham: verify scan failed: {str(e)[:150]}")
         return None
 
 
-def check_environment():
-    if get_brave_path():
-        return True
-    return False
+def check_environment(prefer=None):
+    """Return the (name, path) of the first available Chromium-family browser."""
+    return find_browser(prefer=prefer)
 
 
 class BrowserContext:
-    def __init__(self):
+    def __init__(self, prefer_browser=None):
         self.driver = None
+        self.prefer_browser = prefer_browser
 
-    async def start(self, url, extension_path=None, proxy=None, fingerprint=None):
-        brave_path = get_brave_path()
-        if not brave_path:
-            log_event("ERROR", "brave browser not found")
+    async def start(self, url, extension_path=None, proxy=None, fingerprint=None, retries=1, launch_timeout=45.0):
+        found = find_browser(prefer=self.prefer_browser)
+        if not found:
+            log_event("ERROR", "no Chromium-family browser found. Install one of:")
+            for line in describe_browser_candidates().splitlines():
+                log_event("ERROR", line)
             return None
+        browser_name, browser_path = found
+        log_event("INFO", f"launching {browser_name} ({browser_path})")
 
         args = ["--lang=en-US"]
         if fingerprint:
@@ -1561,22 +2125,40 @@ class BrowserContext:
             args.append(f"--load-extension={extension_path}")
             args.append(f"--disable-extensions-except={extension_path}")
 
-        try:
+        async def _do_launch():
             self.driver = await uc.start(
-                browser_executable_path=brave_path,
+                browser_executable_path=browser_path,
                 browser_args=args,
-                proxy=proxy
+                proxy=proxy,
             )
             tab = await self.driver.get(url)
-            await tab.wait_for_ready_state('complete', timeout=30000)
+            await tab.wait_for_ready_state("complete", timeout=30000)
             try:
                 await tab.evaluate(JS_UTILS)
-            except:
+            except Exception:
                 pass
             return tab
-        except Exception as e:
-            log_event("ERROR", f"browser start failed: {str(e)}")
-            return None
+
+        last_err = None
+        for attempt in range(retries + 1):
+            try:
+                return await asyncio.wait_for(_do_launch(), timeout=launch_timeout)
+            except asyncio.TimeoutError:
+                last_err = TimeoutError(f"browser launch exceeded {launch_timeout}s")
+                log_event("WARNING", f"browser start attempt {attempt + 1} timed out after {launch_timeout}s")
+            except Exception as e:
+                last_err = e
+                log_event("WARNING", f"browser start attempt {attempt + 1} failed: {str(e)[:200]}")
+            try:
+                if self.driver:
+                    await self.driver.stop()
+            except Exception:
+                pass
+            self.driver = None
+            if attempt < retries:
+                await asyncio.sleep(1.5)
+        log_event("ERROR", f"browser start failed after {retries + 1} attempts: {str(last_err)[:200]}")
+        return None
 
     async def stop(self):
         if self.driver:
@@ -1589,16 +2171,18 @@ class BrowserContext:
 
 
 class AccountCreator:
-    def __init__(self, api_key, mailbox_class, extension_path=None, proxy=None, custom_display_name=None, fingerprint=None):
+    def __init__(self, api_key, mailbox_class, extension_path=None, proxy=None, custom_display_name=None, fingerprint=None, captcha_chain=None, prefer_browser=None):
         self.extension_path = extension_path
         self.proxy = proxy
         self.custom_display_name = custom_display_name
         self.fingerprint = fingerprint
         self.mailbox = mailbox_class(api_key)
-        self.browser = BrowserContext()
+        self.browser = BrowserContext(prefer_browser=prefer_browser)
+        self.captcha_chain = captcha_chain or CaptchaSolverChain([CaptchaSolver()])
         self.password = None
         self.email = None
         self.token = None
+        self.last_failure_reason = None
         self.session = tls_client.Session(
             client_identifier="chrome_131",
             random_tls_extension_order=True
@@ -1638,6 +2222,8 @@ class AccountCreator:
             if not page:
                 log_event("ERROR", "browser failed")
                 return None
+
+            await self._hook_register_watcher(page)
 
             if self.fingerprint:
                 try:
@@ -1682,9 +2268,14 @@ class AccountCreator:
             return None, 0
 
     async def human_type(self, element, text: str):
-        for char in text:
+        # Realistic per-character delay reduces Discord's bot-cadence signal.
+        # Values calibrated to a fast-but-human 250-400 CPM typing speed.
+        for i, char in enumerate(text):
             await element.send_keys(char)
-            await asyncio.sleep(random.uniform(0.005, 0.02))
+            delay = random.uniform(0.04, 0.12)
+            if random.random() < 0.06:
+                delay += random.uniform(0.15, 0.35)  # occasional pause / think
+            await asyncio.sleep(delay)
 
     async def clear_and_type(self, page, selector: str, value: str, timeout: int = 45):
         try:
@@ -1738,27 +2329,23 @@ class AccountCreator:
         return None 
 
     async def fill_registration_form(self, page, email: str, display_name: str, username: str, password: str) -> bool:
+        # Inter-field pauses of 200-500ms mimic a real user tab-switching
+        # between form inputs and blunts the "typed 4 fields in 800ms" signal.
+        fields = [
+            ("email",       'input[name="email"]',       email,        45, (0.25, 0.55)),
+            ("display_name",'input[name="global_name"]', display_name, 20, (0.20, 0.50)),
+            ("username",    'input[name="username"]',    username,     20, (0.20, 0.50)),
+            ("password",    'input[name="password"]',    password,     20, (0.25, 0.60)),
+        ]
         try:
-            try:
-                await self.clear_and_type(page, 'input[name="email"]', email, timeout=45)
-                await asyncio.sleep(random.uniform(0.05, 0.15))
-            except Exception as e:
-                return False
-            try:
-                await self.clear_and_type(page, 'input[name="global_name"]', display_name, timeout=20)
-                await asyncio.sleep(random.uniform(0.05, 0.15))
-            except Exception as e:
-                return False
-            try:
-                await self.clear_and_type(page, 'input[name="username"]', username, timeout=20)
-                await asyncio.sleep(random.uniform(0.05, 0.15))
-            except Exception as e:
-                return False
-            try:
-                await self.clear_and_type(page, 'input[name="password"]', password, timeout=20)
-                await asyncio.sleep(random.uniform(0.05, 0.15))
-            except Exception as e:
-                return False
+            for name, selector, value, timeout, pause in fields:
+                try:
+                    await self.clear_and_type(page, selector, value, timeout=timeout)
+                    await asyncio.sleep(random.uniform(*pause))
+                except Exception as e:
+                    log_event("ERROR", f"form field '{name}' ({selector}) failed: {str(e)[:150]}")
+                    self.last_failure_reason = f"form field failed: {name}"
+                    return False
             await asyncio.sleep(0.1)
             await self.fill_date_of_birth(page)
             await asyncio.sleep(0.05)
@@ -1852,37 +2439,112 @@ class AccountCreator:
             pass
 
     async def handle_challenges(self, page):
-        try:
-            is_active = False
-            for i in range(120):
-                queries = ['iframe[src*="captcha"]', 'div[class*="captcha"]', '.h-captcha', '.g-recaptcha', '[data-sitekey]']
-                detected = False
-                for q in queries:
-                    try:
-                        el = await page.query_selector(q)
-                        if el and await el.is_visible():
-                            detected = True
-                            break
-                    except:
-                        continue
-                
-                if detected and not is_active:
-                    log_event("INFO", "mail pulled")
-                    log_event("WARNING", "captcha appeared")
-                    is_active = True
-                
-                if not detected:
-                    if is_active:
-                        log_event("INFO", "solving captcha")
-                        log_event("SUCCESS", "captcha solved")
-                        return True
-                    elif i >= 10:
-                        return True
-                
-                await asyncio.sleep(0.5)
-        except Exception as e:
-            pass
+        # Wait briefly for any challenge to appear; if none within a few
+        # seconds, the flow can proceed. If one does appear, hand it to
+        # the configured solver chain (extension first, AI fallbacks after).
+        for i in range(10):
+            if await _captcha_visible(page):
+                log_event("WARNING", "captcha appeared")
+                return await self.captcha_chain.solve(page)
+            await asyncio.sleep(0.5)
         return True
+
+    async def _hook_register_watcher(self, page):
+        """Attach a CDP listener that logs why Discord rejects a register POST.
+
+        The extension may solve every challenge perfectly, but if Discord
+        rejects the resulting token (bad reputation, expired sitekey,
+        rate-limit) it silently issues a fresh CAPTCHA. Without this hook
+        the user sees "captcha appeared again" and no reason. With it,
+        they see e.g. "discord rejected captcha: invalid-input-response".
+        """
+        try:
+            import truedriver.cdp.network as cdp_network
+        except Exception as e:
+            log_event("WARNING", f"cdp network module unavailable: {str(e)[:120]}")
+            return
+        try:
+            await page.send(cdp_network.enable())
+        except Exception as e:
+            log_event("WARNING", f"could not enable network domain: {str(e)[:120]}")
+            return
+
+        seen_request_ids = set()
+
+        async def on_response(event, connection=None):
+            # truedriver calls handlers with (event, connection); accept both
+            # signatures explicitly instead of relying on its TypeError retry.
+            try:
+                resp = getattr(event, "response", None)
+                url = getattr(resp, "url", "") or ""
+                if "/auth/register" not in url and "/api/v9/register" not in url:
+                    return
+                request_id = getattr(event, "request_id", None) or getattr(event, "requestId", None)
+                if request_id is None or request_id in seen_request_ids:
+                    return
+                seen_request_ids.add(request_id)
+                status = getattr(resp, "status", 0)
+                # ResponseReceived fires before the body is fetchable; wait a
+                # beat so get_response_body doesn't return empty on the race.
+                await asyncio.sleep(0.3)
+                body = ""
+                for _ in range(3):
+                    try:
+                        body_result = await page.send(cdp_network.get_response_body(request_id=request_id))
+                        body = body_result[0] if isinstance(body_result, tuple) else body_result
+                        if body:
+                            break
+                    except Exception:
+                        await asyncio.sleep(0.4)
+                self._analyze_register_response(status, body)
+            except Exception as e:
+                log_event("WARNING", f"register watcher raised: {str(e)[:120]}")
+
+        try:
+            page.add_handler(cdp_network.ResponseReceived, on_response)
+        except Exception as e:
+            log_event("WARNING", f"could not attach register watcher: {str(e)[:120]}")
+
+    def _analyze_register_response(self, status, body):
+        """Emit one focused error per known Discord rejection reason."""
+        text = body if isinstance(body, str) else ""
+        try:
+            payload = json.loads(text) if text else {}
+        except Exception:
+            payload = {}
+
+        if status == 429 or "1015" in text:
+            retry = payload.get("retry_after") or payload.get("retry-after")
+            log_event("ERROR", f"discord rate-limited (429{f', retry after {retry}s' if retry else ''}) - bad proxy reputation")
+            self.last_failure_reason = "rate-limited (bad proxy reputation)"
+            return
+
+        captcha_keys = payload.get("captcha_key") or []
+        if captcha_keys:
+            reasons = {
+                "captcha-required": "discord demanded a captcha (initial challenge)",
+                "invalid-input-response": "discord rejected the captcha token (solver returned bad answer or token expired)",
+                "sitekey-secret-mismatch": "discord's sitekey doesn't match the solver's expected one (solver key mis-configured)",
+                "response-mismatch": "discord's captcha token doesn't match its session (proxy/IP changed mid-solve)",
+                "invalid-solution": "discord rejected the specific answer (wrong tiles / wrong text)",
+            }
+            for k in captcha_keys:
+                log_event("ERROR", f"discord captcha rejection: {reasons.get(k, k)}")
+            svc = payload.get("captcha_service")
+            if svc:
+                log_event("INFO", f"discord captcha service: {svc}")
+            self.last_failure_reason = f"captcha rejection: {captcha_keys[0]}"
+            return
+
+        errors = payload.get("errors") or {}
+        if errors:
+            log_event("ERROR", f"discord register error: {str(errors)[:250]}")
+            self.last_failure_reason = f"register error: {list(errors)[:3]}"
+            return
+
+        if status >= 400:
+            log_event("ERROR", f"discord register HTTP {status}: {text[:200]}")
+            self.last_failure_reason = f"HTTP {status}"
 
     async def get_generated_token(self, page):
         script = """
@@ -2043,11 +2705,26 @@ class AccountCreator:
 
 
 
+DEFAULT_FP_FILE = Path(get_path("data/fingerprints_default.jsonl"))
+_default_fp_cursor = 0
+
+
 def _load_fp_lines() -> list:
     if not FP_FILE.exists():
         return []
     lines = []
     for line in FP_FILE.read_text(encoding='utf-8').splitlines():
+        line = line.strip()
+        if line and not line.startswith('#'):
+            lines.append(line)
+    return lines
+
+
+def _load_default_fp_lines() -> list:
+    if not DEFAULT_FP_FILE.exists():
+        return []
+    lines = []
+    for line in DEFAULT_FP_FILE.read_text(encoding='utf-8').splitlines():
         line = line.strip()
         if line and not line.startswith('#'):
             lines.append(line)
@@ -2069,20 +2746,36 @@ def parse_fingerprint_line(raw_line: str) -> dict:
 
 
 def peek_next_fingerprint() -> tuple:
+    """Return (parsed_dict, raw_line_or_None).
+
+    User-supplied lines in input/fp.txt take priority (one-time use, consumed
+    after each account). When that file is empty, cycle through the bundled
+    default pool at data/fingerprints_default.jsonl (never consumed).
+    """
+    global _default_fp_cursor
     with _fp_lock:
         lines = _load_fp_lines()
-        if not lines:
+        if lines:
+            raw_line = lines[0]
+            return parse_fingerprint_line(raw_line), raw_line
+        defaults = _load_default_fp_lines()
+        if not defaults:
             return None, None
-        raw_line = lines[0]
-        return parse_fingerprint_line(raw_line), raw_line
+        raw_line = defaults[_default_fp_cursor % len(defaults)]
+        _default_fp_cursor += 1
+        return parse_fingerprint_line(raw_line), None
 
 
 def consume_fingerprint_line(raw_line: str) -> bool:
+    """Remove one user-supplied fingerprint after use (one-time-use design)."""
+    if raw_line is None:
+        return False
     with _fp_lock:
         lines = _load_fp_lines()
         if raw_line not in lines:
             return False
-        FP_FILE.write_text(chr(10).join(lines) + (chr(10) if lines else ""), encoding="utf-8")
+        lines.remove(raw_line)
+        FP_FILE.write_text(("\n".join(lines) + "\n") if lines else "", encoding="utf-8")
         return True
 
 
@@ -2217,132 +2910,248 @@ def setup_files():
 
 
 
+SERVICES = {
+    "c": ("Cybertemp", MailboxClient, "cybertemp_key", True),
+    "h": ("Hotmail", Hotmail007Provider, "hotmail007_key", True),
+    "z": ("Zeus-X", ZeusXProvider, "zeusx_key", True),
+    "a": ("Afham", AfhamMailProvider, "afham_mail_api9_key", False),
+    "d": ("DuckMail", DuckMailProvider, "duckmail_key", False),
+    "r": ("CrowMail", CrowMailProvider, "crowmail_key", True),
+}
+
+
+def load_and_validate_config():
+    """Return (cfg, use_vpn, vpn_delay) or None on any fatal config error.
+
+    Every failure path emits one specific log_event so the user can fix
+    the config without guessing what went wrong.
+    """
+    config_path = get_path("config/config.yaml")
+    if not os.path.exists(config_path):
+        log_event("ERROR", f"config not found at: {config_path}")
+        return None
+    try:
+        with open(config_path, "r") as f:
+            cfg = yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        log_event("ERROR", f"config.yaml is not valid yaml: {str(e)[:200]}")
+        return None
+    except OSError as e:
+        log_event("ERROR", f"could not read config.yaml: {e}")
+        return None
+    if cfg is None:
+        cfg = {}
+    if not isinstance(cfg, dict):
+        log_event("ERROR", "config.yaml must be a mapping at the top level")
+        return None
+    use_vpn = bool(cfg.get("vpn", False))
+    raw_delay = cfg.get("vpn_delay", 120)
+    try:
+        vpn_delay = int(raw_delay)
+    except (TypeError, ValueError):
+        log_event("ERROR", f"config.yaml vpn_delay must be an integer, got {raw_delay!r}")
+        return None
+    if vpn_delay < 0:
+        log_event("ERROR", f"config.yaml vpn_delay must be >= 0, got {vpn_delay}")
+        return None
+    return cfg, use_vpn, vpn_delay
+
+
 async def main():
     clear_screen()
     set_console_title()
     setup_files()
-    
-    try:
-        config_path = get_path("config/config.yaml")
-        if not os.path.exists(config_path):
-            log_event("ERROR", f"config not found at: {config_path}")
-            prompt_user("press enter to exit")
-            return
 
-        with open(config_path, "r") as f:
-            cfg = yaml.safe_load(f)
-            use_vpn = cfg.get('vpn', False)
-            vpn_delay = int(cfg.get('vpn_delay', 120))
-    except Exception as e:
-        log_event("ERROR", f"config error: {e}")
+    loaded = load_and_validate_config()
+    if loaded is None:
         prompt_user("press enter to exit")
         return
+    cfg, use_vpn, vpn_delay = loaded
 
     if use_vpn:
         await mullvad_ensure_connected()
 
-    if not check_environment():
-        log_event("WARNING", "brave not found")
+    prefer_browser = (cfg.get("browser") or "").strip() or None
+    browser = check_environment(prefer=prefer_browser)
+    if browser:
+        log_event("INFO", f"browser: {browser[0]} ({browser[1]})")
+    else:
+        log_event("WARNING", "no Chromium-family browser found. Candidates:")
+        for line in describe_browser_candidates().splitlines():
+            log_event("WARNING", line)
 
-    proxies = load_proxies(cfg)
+    proxy_pool = await build_proxy_pool(cfg)
 
     show_interface()
-    
-    service = prompt_user("Choose service - Cybertemp (C), Hotmail (H), Zeus-X (Z), Afham (A), DuckMail (D) or CrowMail (R): ").strip().lower()
-    if service == 'h':
-        key = cfg.get('hotmail007_key')
-        mailbox_class = Hotmail007Provider
-    elif service == 'z':
-        key = cfg.get('zeusx_key')
-        mailbox_class = ZeusXProvider
-    elif service == 'a':
-        key = cfg.get('afham_mail_api9_key', '')
-        mailbox_class = AfhamMailProvider
-    elif service == 'd':
-        key = cfg.get('duckmail_key', '')
-        mailbox_class = DuckMailProvider
-    elif service == 'r':
-        key = cfg.get('crowmail_key', '')
-        mailbox_class = CrowMailProvider
-    else:
-        key = cfg.get('cybertemp_key')
-        mailbox_class = MailboxClient
 
-    if not key and service not in ('d',):
-        log_event("WARNING", f"no api key found for service '{service.upper()}'. please check config.yaml")
+    service_prompt = "Choose service - Cybertemp (C), Hotmail (H), Zeus-X (Z), Afham (A), DuckMail (D) or CrowMail (R): "
+    choice = prompt_user(service_prompt).strip().lower()
+    if choice not in SERVICES:
+        log_event("WARNING", f"unrecognized service '{choice}', defaulting to Cybertemp")
+        choice = "c"
+    service_name, mailbox_class, key_field, key_required = SERVICES[choice]
+    key = (cfg.get(key_field) or "").strip()
+    if not key and key_required:
+        log_event("WARNING", f"no api key found for {service_name} (config.yaml -> {key_field})")
 
     clear_screen()
-    ext_path = await setup_freek(log_event)
+    ext_path = await setup_leninja(log_event)
+    captcha_chain = build_captcha_chain(cfg)
+    log_event("INFO", f"captcha chain: {', '.join(s.name for s in captcha_chain.solvers)}")
     _fp_count = len(_load_fp_lines())
+    _default_fp_count = len(_load_default_fp_lines())
     if _fp_count > 0:
-        log_event("INFO", f"{_fp_count} fingerprint(s) loaded from input/fp.txt")
+        log_event("INFO", f"{_fp_count} fingerprint(s) loaded from input/fp.txt (one-time use)")
+    elif _default_fp_count > 0:
+        log_event("INFO", f"input/fp.txt empty - rotating through {_default_fp_count} default fingerprints from data/fingerprints_default.jsonl")
     else:
-        log_event("INFO", "no fingerprints loaded (input/fp.txt empty) - running without fingerprints")
+        log_event("WARNING", "no fingerprints available - Discord may cluster accounts")
 
     
+    # target: how many accounts to make (0 = infinite)
+    # workers: how many parallel account attempts (1 = serial, current behavior)
+    target = 1
+    workers = 1
     if len(sys.argv) > 1:
         try:
             target = int(sys.argv[1])
-        except:
-            target = 1
+        except Exception:
+            pass
     else:
         try:
             target = int(prompt_user("How many accounts to gen 0 = ∞: "))
-        except:
+        except Exception:
             target = 1
+    if len(sys.argv) > 2:
+        try:
+            workers = max(1, int(sys.argv[2]))
+        except Exception:
+            pass
+    else:
+        try:
+            workers = max(1, int(cfg.get("workers", 1)))
+        except Exception:
+            workers = 1
+
+    if workers > 1 and use_vpn:
+        log_event("WARNING", "workers > 1 disables VPN rotation (Mullvad is single-tunnel); rely on the proxy pool instead")
+        use_vpn = False
 
     custom_display_name = None
-    done = 0
     start = time.time()
-    success = 0
-    
+    metrics = RunMetrics()
     try:
-        while True:
-            if target != 0 and done >= target: break
-            done += 1
-            log_event("INFO", f"creating acc # {done}")
-            
+        attempt_timeout = float(cfg.get("attempt_timeout", 240))
+    except (TypeError, ValueError):
+        attempt_timeout = 240.0
+
+    async def run_one_attempt(attempt_num, worker_label=""):
+        """Run a single account attempt and record its outcome in metrics.
+
+        Wrapped in asyncio.wait_for(attempt_timeout) so a stalled browser
+        page or a captcha loop that never terminates can no longer hang the
+        entire run. The whole attempt is killed and counted as invalid.
+        """
+        prefix = f"{worker_label}" if worker_label else ""
+        log_event("INFO", f"{prefix}creating acc # {attempt_num}")
+        engine = None
+        chosen_proxy = None
+        _fp_raw = None
+        try:
+            _fp_dict, _fp_raw = peek_next_fingerprint()
+            chosen_proxy = proxy_pool.next() if isinstance(proxy_pool, ProxyPool) else get_random_proxy(proxy_pool)
+            engine = AccountCreator(
+                key, mailbox_class,
+                extension_path=ext_path, proxy=chosen_proxy,
+                custom_display_name=custom_display_name,
+                fingerprint=_fp_dict, captcha_chain=captcha_chain,
+                prefer_browser=prefer_browser,
+            )
             try:
-                _fp_dict, _fp_raw = peek_next_fingerprint()
-                engine = AccountCreator(key, mailbox_class, extension_path=ext_path, proxy=get_random_proxy(proxies), custom_display_name=custom_display_name, fingerprint=_fp_dict)
-                resp = await engine.run()
-
-                # Consume fingerprint after every use (one-time use)
-                if _fp_raw:
-                    consume_fingerprint_line(_fp_raw)
-
-                if resp and len(resp) == 2:
-                    token, took = resp
-                    if token == "LOCKED":
-                        success += 1
-                    elif token:
-                        log_event("SUCCESS", "valid")
-                        success += 1
-                    else:
-                        log_event("ERROR", f"failed #{done}")
+                resp = await asyncio.wait_for(engine.run(), timeout=attempt_timeout)
+            except asyncio.TimeoutError:
+                log_event("ERROR", f"{prefix}attempt timed out after {attempt_timeout:.0f}s")
+                engine.last_failure_reason = f"attempt timeout ({attempt_timeout:.0f}s)"
+                try:
+                    await engine.browser.stop()
+                except Exception:
+                    pass
+                resp = None
+            if _fp_raw:
+                consume_fingerprint_line(_fp_raw)
+            run_ok = bool(resp and len(resp) == 2 and resp[0])
+            elapsed_attempt = (resp[1] if resp and len(resp) == 2 else 0) or 0
+            if run_ok:
+                token = resp[0]
+                if token == "LOCKED":
+                    metrics.record(service_name, chosen_proxy, "locked", elapsed=elapsed_attempt)
                 else:
-                    log_event("ERROR", f"failed #{done}")
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                log_event("ERROR", f"error: {e}")
-                continue
-                
-            if target == 1: break
-            elif target != 0 and done >= target: break
+                    log_event("SUCCESS", f"{prefix}valid")
+                    metrics.record(service_name, chosen_proxy, "valid", elapsed=elapsed_attempt)
+                if isinstance(proxy_pool, ProxyPool):
+                    proxy_pool.report_success(chosen_proxy)
             else:
+                log_event("ERROR", f"{prefix}failed #{attempt_num}")
+                metrics.record(service_name, chosen_proxy, "invalid",
+                               elapsed=elapsed_attempt,
+                               reason=getattr(engine, "last_failure_reason", "unknown"))
+                if isinstance(proxy_pool, ProxyPool):
+                    proxy_pool.report_failure(chosen_proxy)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log_event("ERROR", f"{prefix}error: {e}")
+
+    try:
+        if workers == 1:
+            done = 0
+            while True:
+                if target != 0 and done >= target:
+                    break
+                done += 1
+                await run_one_attempt(done)
+                if target == 1:
+                    break
+                if target != 0 and done >= target:
+                    break
                 if use_vpn:
                     await rotate_mullvad_ip()
                 else:
                     await animated_cooldown(vpn_delay)
-                
+        else:
+            log_event("INFO", f"running with {workers} concurrent workers (target={target or '∞'})")
+            claimed = 0
+            claim_lock = asyncio.Lock()
+
+            async def claim_next():
+                nonlocal claimed
+                async with claim_lock:
+                    if target != 0 and claimed >= target:
+                        return None
+                    claimed += 1
+                    return claimed
+
+            async def worker(wid):
+                while True:
+                    n = await claim_next()
+                    if n is None:
+                        return
+                    await run_one_attempt(n, worker_label=f"[w{wid}] ")
+
+            worker_tasks = [asyncio.create_task(worker(i + 1)) for i in range(workers)]
+            try:
+                await asyncio.gather(*worker_tasks)
+            except asyncio.CancelledError:
+                for t in worker_tasks:
+                    t.cancel()
+                await asyncio.gather(*worker_tasks, return_exceptions=True)
+                raise
     except KeyboardInterrupt:
         log_event("SUCCESS", "exiting...")
     finally:
         await shutdown_engine()
-        
-    elapsed = time.time() - start
-    log_event("INFO", f"generated {success} valid tokens in ({elapsed:.1f}s)")
+
+    metrics.print_summary()
     prompt_user("press enter to exit")
 
 if __name__ == '__main__':

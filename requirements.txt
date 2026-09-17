@@ -4,3 +4,7 @@ colorama @ https://github.com/tartley/colorama/archive/refs/tags/0.4.6.zip
 truedriver
 pystyle
 pyyaml
+# Optional AI CAPTCHA fallbacks (loaded only when the matching key is
+# set in config.yaml; safe to omit if you rely on the extension alone).
+anthropic
+groq
