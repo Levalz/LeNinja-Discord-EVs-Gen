@@ -641,10 +641,14 @@ class GroqCaptchaSolver(CaptchaSolver):
     """Groq vision fallback for text CAPTCHAs (rare Discord fallback path)."""
     name = "groq"
 
-    def __init__(self, api_key, wait_seconds=25):
+    # Groq deprecates preview model IDs frequently; keep this overridable
+    # from config so users can bump it without editing code.
+    DEFAULT_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+
+    def __init__(self, api_key, wait_seconds=25, model=None):
         super().__init__(wait_seconds=wait_seconds)
         self.api_key = (api_key or "").strip()
-        self.model = "llama-3.2-90b-vision-preview"
+        self.model = (model or self.DEFAULT_MODEL).strip()
         self._client = None
         if self.api_key and GROQ_AVAILABLE:
             try:
@@ -691,10 +695,12 @@ class ClaudeCaptchaSolver(CaptchaSolver):
     """Claude vision fallback for text CAPTCHAs."""
     name = "claude"
 
-    def __init__(self, api_key, wait_seconds=25, model="claude-sonnet-5"):
+    DEFAULT_MODEL = "claude-sonnet-5"
+
+    def __init__(self, api_key, wait_seconds=25, model=None):
         super().__init__(wait_seconds=wait_seconds)
         self.api_key = (api_key or "").strip()
-        self.model = model
+        self.model = (model or self.DEFAULT_MODEL).strip()
         self._client = None
         if self.api_key and ANTHROPIC_AVAILABLE:
             try:
@@ -771,37 +777,24 @@ _CAPTCHA_QUERIES = [
 
 async def _first_visible_selector(page, queries):
     """Return the first CSS selector from `queries` that matches a laid-out
-    element with non-zero size and displayable style.
+    element with non-zero size and displayable style, or None.
 
-    truedriver's Element has no `is_visible()`, so we do the whole check in
-    the page via evaluate() and return the surviving selector string; the
-    caller can then re-query for the Element handle when it needs one.
+    truedriver's Element has no `is_visible()` and its Tab.evaluate takes
+    only an expression string (no `args=` kwarg), so we inline the query
+    list into the JS and run one round-trip.
     """
     try:
-        return await page.evaluate('''(sels) => {
-            for (const s of sels) {
-                const el = document.querySelector(s);
-                if (!el) continue;
-                const r = el.getBoundingClientRect();
-                if (r.width <= 0 || r.height <= 0) continue;
-                const st = window.getComputedStyle(el);
-                if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') continue;
-                return s;
-            }
-            return null;
-        }''', args=[queries])
+        js = (
+            "(() => { const sels = " + json.dumps(queries) + "; "
+            "for (const s of sels) { const el = document.querySelector(s); if (!el) continue; "
+            "const r = el.getBoundingClientRect(); if (r.width <= 0 || r.height <= 0) continue; "
+            "const st = window.getComputedStyle(el); "
+            "if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') continue; "
+            "return s; } return null; })()"
+        )
+        return await page.evaluate(js)
     except Exception:
-        # Older truedrivers reject the `args` kwarg; fall back to inlining.
-        try:
-            js = "(() => { const sels = " + json.dumps(queries) + "; " + \
-                 "for (const s of sels) { const el = document.querySelector(s); if (!el) continue; " + \
-                 "const r = el.getBoundingClientRect(); if (r.width <= 0 || r.height <= 0) continue; " + \
-                 "const st = window.getComputedStyle(el); " + \
-                 "if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') continue; " + \
-                 "return s; } return null; })()"
-            return await page.evaluate(js)
-        except Exception:
-            return None
+        return None
 
 
 async def _captcha_visible(page):
@@ -881,13 +874,13 @@ def build_captcha_chain(cfg):
         if not GROQ_AVAILABLE:
             log_event("WARNING", "groq_key set but 'groq' package not installed - skipping")
         else:
-            solvers.append(GroqCaptchaSolver(groq_key))
+            solvers.append(GroqCaptchaSolver(groq_key, model=(cfg.get("groq_model") or "").strip() or None))
     anthropic_key = (cfg.get("anthropic_key") or "").strip()
     if anthropic_key:
         if not ANTHROPIC_AVAILABLE:
             log_event("WARNING", "anthropic_key set but 'anthropic' package not installed - skipping")
         else:
-            solvers.append(ClaudeCaptchaSolver(anthropic_key))
+            solvers.append(ClaudeCaptchaSolver(anthropic_key, model=(cfg.get("anthropic_model") or "").strip() or None))
     return CaptchaSolverChain(solvers)
 
 
@@ -2466,7 +2459,9 @@ class AccountCreator:
             log_event("WARNING", f"could not enable network domain: {str(e)[:120]}")
             return
 
-        async def on_response(event):
+        async def on_response(event, connection=None):
+            # truedriver calls handlers with (event, connection); accept both
+            # signatures explicitly instead of relying on its TypeError retry.
             try:
                 resp = getattr(event, "response", None)
                 url = getattr(resp, "url", "") or ""
@@ -2476,14 +2471,21 @@ class AccountCreator:
                 request_id = getattr(event, "request_id", None) or getattr(event, "requestId", None)
                 if request_id is None:
                     return
-                try:
-                    body_result = await page.send(cdp_network.get_response_body(request_id=request_id))
-                    body = body_result[0] if isinstance(body_result, tuple) else body_result
-                except Exception:
-                    body = ""
+                # ResponseReceived fires before the body is fetchable; wait a
+                # beat so get_response_body doesn't return empty on the race.
+                await asyncio.sleep(0.3)
+                body = ""
+                for _ in range(3):
+                    try:
+                        body_result = await page.send(cdp_network.get_response_body(request_id=request_id))
+                        body = body_result[0] if isinstance(body_result, tuple) else body_result
+                        if body:
+                            break
+                    except Exception:
+                        await asyncio.sleep(0.4)
                 self._analyze_register_response(status, body)
-            except Exception:
-                pass
+            except Exception as e:
+                log_event("WARNING", f"register watcher raised: {str(e)[:120]}")
 
         try:
             page.add_handler(cdp_network.ResponseReceived, on_response)

@@ -10,8 +10,13 @@ crowmail_key: ""
 
 # AI CAPTCHA fallback keys. The LeNinja/Nopecha extension solves first;
 # these run only if the extension fails. Leave empty to disable.
+# Groq deprecates preview model IDs frequently — check
+# https://console.groq.com/docs/models and set groq_model to a current
+# vision-capable model. Same for anthropic_model (claude vision model).
 groq_key: ""
+groq_model: ""          # empty = solver's built-in default
 anthropic_key: ""
+anthropic_model: ""     # empty = solver's built-in default
 captcha_extension_wait: 60
 
 # Preferred browser (Brave, Chrome, Chromium, Edge). Leave empty to
