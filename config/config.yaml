@@ -1,5 +1,12 @@
 vpn: false
 vpn_delay: 120
+# How many accounts to generate in parallel. Default 1 = serial (safe,
+# same as before). Bump only when your proxy pool has that many alive
+# proxies AND your extension key has enough credit — each worker uses
+# one browser instance and one solve credit per attempt. Enabling
+# workers > 1 disables Mullvad VPN rotation automatically (single-tunnel).
+# Override at runtime with `python main.py <target> <workers>`.
+workers: 1
 cybertemp_key: ""
 draxon_key: ""
 hotmail007_key: ""

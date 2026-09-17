@@ -2995,78 +2995,132 @@ async def main():
         log_event("WARNING", "no fingerprints available - Discord may cluster accounts")
 
     
+    # target: how many accounts to make (0 = infinite)
+    # workers: how many parallel account attempts (1 = serial, current behavior)
+    target = 1
+    workers = 1
     if len(sys.argv) > 1:
         try:
             target = int(sys.argv[1])
-        except:
-            target = 1
+        except Exception:
+            pass
     else:
         try:
             target = int(prompt_user("How many accounts to gen 0 = ∞: "))
-        except:
+        except Exception:
             target = 1
+    if len(sys.argv) > 2:
+        try:
+            workers = max(1, int(sys.argv[2]))
+        except Exception:
+            pass
+    else:
+        try:
+            workers = max(1, int(cfg.get("workers", 1)))
+        except Exception:
+            workers = 1
+
+    if workers > 1 and use_vpn:
+        log_event("WARNING", "workers > 1 disables VPN rotation (Mullvad is single-tunnel); rely on the proxy pool instead")
+        use_vpn = False
 
     custom_display_name = None
-    done = 0
     start = time.time()
-    success = 0
     metrics = RunMetrics()
-    
-    try:
-        while True:
-            if target != 0 and done >= target: break
-            done += 1
-            log_event("INFO", f"creating acc # {done}")
-            
-            try:
-                _fp_dict, _fp_raw = peek_next_fingerprint()
-                chosen_proxy = proxy_pool.next() if isinstance(proxy_pool, ProxyPool) else get_random_proxy(proxy_pool)
-                engine = AccountCreator(key, mailbox_class, extension_path=ext_path, proxy=chosen_proxy, custom_display_name=custom_display_name, fingerprint=_fp_dict, captcha_chain=captcha_chain, prefer_browser=prefer_browser)
-                resp = await engine.run()
 
-                # Consume fingerprint after every use (one-time use)
-                if _fp_raw:
-                    consume_fingerprint_line(_fp_raw)
+    async def run_one_attempt(attempt_num, worker_label=""):
+        """Run a single account attempt and record its outcome in metrics.
 
-                run_ok = bool(resp and len(resp) == 2 and resp[0])
-                elapsed_attempt = (resp[1] if resp and len(resp) == 2 else 0) or 0
-                if run_ok:
-                    token = resp[0]
-                    if token == "LOCKED":
-                        success += 1
-                        metrics.record(service_name, chosen_proxy, "locked", elapsed=elapsed_attempt)
-                    else:
-                        log_event("SUCCESS", "valid")
-                        success += 1
-                        metrics.record(service_name, chosen_proxy, "valid", elapsed=elapsed_attempt)
-                    if isinstance(proxy_pool, ProxyPool):
-                        proxy_pool.report_success(chosen_proxy)
+        Called both from the serial and worker-pool paths. The `worker_label`
+        prefix (e.g. "[w2] ") lets concurrent output be attributed.
+        """
+        prefix = f"{worker_label}" if worker_label else ""
+        log_event("INFO", f"{prefix}creating acc # {attempt_num}")
+        try:
+            _fp_dict, _fp_raw = peek_next_fingerprint()
+            chosen_proxy = proxy_pool.next() if isinstance(proxy_pool, ProxyPool) else get_random_proxy(proxy_pool)
+            engine = AccountCreator(
+                key, mailbox_class,
+                extension_path=ext_path, proxy=chosen_proxy,
+                custom_display_name=custom_display_name,
+                fingerprint=_fp_dict, captcha_chain=captcha_chain,
+                prefer_browser=prefer_browser,
+            )
+            resp = await engine.run()
+            if _fp_raw:
+                consume_fingerprint_line(_fp_raw)
+            run_ok = bool(resp and len(resp) == 2 and resp[0])
+            elapsed_attempt = (resp[1] if resp and len(resp) == 2 else 0) or 0
+            if run_ok:
+                token = resp[0]
+                if token == "LOCKED":
+                    metrics.record(service_name, chosen_proxy, "locked", elapsed=elapsed_attempt)
                 else:
-                    log_event("ERROR", f"failed #{done}")
-                    metrics.record(service_name, chosen_proxy, "invalid",
-                                   elapsed=elapsed_attempt,
-                                   reason=getattr(engine, "last_failure_reason", "unknown"))
-                    if isinstance(proxy_pool, ProxyPool):
-                        proxy_pool.report_failure(chosen_proxy)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                log_event("ERROR", f"error: {e}")
-                continue
-                
-            if target == 1: break
-            elif target != 0 and done >= target: break
+                    log_event("SUCCESS", f"{prefix}valid")
+                    metrics.record(service_name, chosen_proxy, "valid", elapsed=elapsed_attempt)
+                if isinstance(proxy_pool, ProxyPool):
+                    proxy_pool.report_success(chosen_proxy)
             else:
+                log_event("ERROR", f"{prefix}failed #{attempt_num}")
+                metrics.record(service_name, chosen_proxy, "invalid",
+                               elapsed=elapsed_attempt,
+                               reason=getattr(engine, "last_failure_reason", "unknown"))
+                if isinstance(proxy_pool, ProxyPool):
+                    proxy_pool.report_failure(chosen_proxy)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log_event("ERROR", f"{prefix}error: {e}")
+
+    try:
+        if workers == 1:
+            done = 0
+            while True:
+                if target != 0 and done >= target:
+                    break
+                done += 1
+                await run_one_attempt(done)
+                if target == 1:
+                    break
+                if target != 0 and done >= target:
+                    break
                 if use_vpn:
                     await rotate_mullvad_ip()
                 else:
                     await animated_cooldown(vpn_delay)
-                
+        else:
+            log_event("INFO", f"running with {workers} concurrent workers (target={target or '∞'})")
+            claimed = 0
+            claim_lock = asyncio.Lock()
+
+            async def claim_next():
+                nonlocal claimed
+                async with claim_lock:
+                    if target != 0 and claimed >= target:
+                        return None
+                    claimed += 1
+                    return claimed
+
+            async def worker(wid):
+                while True:
+                    n = await claim_next()
+                    if n is None:
+                        return
+                    await run_one_attempt(n, worker_label=f"[w{wid}] ")
+
+            worker_tasks = [asyncio.create_task(worker(i + 1)) for i in range(workers)]
+            try:
+                await asyncio.gather(*worker_tasks)
+            except asyncio.CancelledError:
+                for t in worker_tasks:
+                    t.cancel()
+                await asyncio.gather(*worker_tasks, return_exceptions=True)
+                raise
     except KeyboardInterrupt:
         log_event("SUCCESS", "exiting...")
     finally:
         await shutdown_engine()
-        
+
     metrics.print_summary()
     prompt_user("press enter to exit")
 
