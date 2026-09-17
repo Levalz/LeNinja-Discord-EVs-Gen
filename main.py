@@ -953,7 +953,7 @@ class MailboxClient:
 
 class Hotmail007Provider:
     def __init__(self, client_key, mail_type="hotmail"):
-        self.client_key = client_key
+        self.client_key = (client_key or "").strip()
         self.mail_type = mail_type
         self.email = None
         self.password = None
@@ -963,50 +963,77 @@ class Hotmail007Provider:
         self.ms_client_id = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
 
     async def get_access_token(self, r_token=None, c_id=None):
+        token = (r_token or self.refresh_token or "").rstrip("$").strip()
+        cid = (c_id or self.uuid or self.ms_client_id or "").strip()
+        if not token:
+            log_event("ERROR", "hotmail007: missing refresh_token")
+            return None
+        url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+        data = {
+            "client_id": cid,
+            "refresh_token": token,
+            "grant_type": "refresh_token",
+            "scope": "https://graph.microsoft.com/.default"
+        }
         try:
-            token = (r_token or self.refresh_token).rstrip("$")
-            cid = c_id or self.uuid or self.ms_client_id
-            url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
-            data = {
-                "client_id": cid,
-                "refresh_token": token,
-                "grant_type": "refresh_token",
-                "scope": "https://graph.microsoft.com/.default"
-            }
             async with httpx.AsyncClient() as client:
                 r = await client.post(url, data=data, timeout=30)
-                if r.status_code == 200:
-                    return r.json().get("access_token")
-        except:
-            pass
+            if r.status_code == 200:
+                return r.json().get("access_token")
+            try:
+                err = r.json()
+                msg = err.get("error_description") or err.get("error") or r.text[:200]
+            except Exception:
+                msg = r.text[:200]
+            log_event("ERROR", f"hotmail007: microsoft oauth {r.status_code}: {msg}")
+        except Exception as e:
+            log_event("ERROR", f"hotmail007: oauth request failed: {str(e)[:150]}")
         return None
 
     async def create_inbox(self):
+        if not self.client_key:
+            log_event("ERROR", "hotmail007: no api key set (config/config.yaml -> hotmail007_key)")
+            return None
         url = f"{self.base_api}/mail/getMail?clientKey={self.client_key}&mailType={self.mail_type}&quantity=1"
         try:
             async with httpx.AsyncClient() as client:
                 r = await client.get(url, timeout=30)
-                if r.status_code == 200:
-                    data = r.json()
-                    if data.get("code") == 0 and data.get("success"):
-                        accounts = data.get("data", [])
-                        if accounts:
-                            parts = accounts[0].split(":")
-                            if len(parts) >= 4:
-                                self.email = parts[0].strip()
-                                self.password = parts[1].strip()
-                                self.refresh_token = parts[2].strip()
-                                self.uuid = parts[3].strip()
-                                return self.email
-                        else:
-                            pass
-                    else:
-                        pass
-                else:
-                    pass
         except Exception as e:
-            pass
-        return None
+            log_event("ERROR", f"hotmail007: network error: {str(e)[:150]}")
+            return None
+
+        if r.status_code != 200:
+            log_event("ERROR", f"hotmail007: HTTP {r.status_code}: {r.text[:200]}")
+            return None
+
+        try:
+            data = r.json()
+        except Exception:
+            log_event("ERROR", f"hotmail007: non-json response: {r.text[:200]}")
+            return None
+
+        if data.get("code") != 0 or not data.get("success"):
+            msg = data.get("msg") or data.get("message") or data.get("error") or str(data)[:200]
+            log_event("ERROR", f"hotmail007: api error (code={data.get('code')}): {msg}")
+            return None
+
+        accounts = data.get("data") or []
+        if not accounts:
+            log_event("ERROR", "hotmail007: api returned empty account list (check balance / stock)")
+            return None
+
+        raw = accounts[0] if isinstance(accounts[0], str) else str(accounts[0])
+        raw = raw.strip().lstrip("﻿")
+        parts = raw.split(":", 3)
+        if len(parts) < 3:
+            log_event("ERROR", f"hotmail007: unexpected account format: {raw[:80]}")
+            return None
+
+        self.email = parts[0].strip()
+        self.password = parts[1].strip()
+        self.refresh_token = parts[2].strip()
+        self.uuid = parts[3].strip() if len(parts) >= 4 and parts[3].strip() else self.ms_client_id
+        return self.email
 
     async def get_verification_url(self):
         if not self.refresh_token:
@@ -1022,32 +1049,34 @@ class Hotmail007Provider:
                     params={"$top": 10, "$orderby": "receivedDateTime desc", "$select": "subject,body,from"},
                     timeout=15
                 )
-                if r.status_code == 200:
-                    for msg in r.json().get("value", []):
-                        subj = msg.get("subject", "").lower()
-                        from_data = msg.get("from", {}).get("emailAddress", {})
-                        frm_addr = from_data.get("address", "").lower()
-                        frm_name = from_data.get("name", "").lower()
-                        is_discord = "discord" in frm_addr or "discord" in frm_name
-                        has_verify = "verify" in subj or "confirm" in subj or "verification" in subj
-                        if is_discord and has_verify:
-                            body = msg.get("body", {}).get("content", "")
-                            body = body.replace("&amp;", "&").replace("&quot;", '"').replace("&#39;", "'")
-                            matches = re.findall(r'https://discord\.com/verify\?token=[^\s"\'><]+', body)
-                            if matches:
-                                return matches[0]
-                            tracked_links = re.findall(r'https://click\.discord\.com/ls/click\?[^\s"\'><]+', body)
-                            for link in tracked_links:
-                                try:
-                                    async with httpx.AsyncClient() as check_client:
-                                        res = await check_client.get(link, follow_redirects=False, timeout=10)
-                                        target = res.headers.get("Location", "")
-                                        if "discord.com/verify" in target:
-                                            return link
-                                except Exception:
-                                    continue
-        except Exception:
-            pass
+            if r.status_code != 200:
+                log_event("WARNING", f"hotmail007: graph {r.status_code}: {r.text[:150]}")
+                return None
+            for msg in r.json().get("value", []):
+                subj = msg.get("subject", "").lower()
+                from_data = msg.get("from", {}).get("emailAddress", {})
+                frm_addr = from_data.get("address", "").lower()
+                frm_name = from_data.get("name", "").lower()
+                is_discord = "discord" in frm_addr or "discord" in frm_name
+                has_verify = "verify" in subj or "confirm" in subj or "verification" in subj
+                if is_discord and has_verify:
+                    body = msg.get("body", {}).get("content", "")
+                    body = body.replace("&amp;", "&").replace("&quot;", '"').replace("&#39;", "'")
+                    matches = re.findall(r'https://discord\.com/verify\?token=[^\s"\'><]+', body)
+                    if matches:
+                        return matches[0]
+                    tracked_links = re.findall(r'https://click\.discord\.com/ls/click\?[^\s"\'><]+', body)
+                    for link in tracked_links:
+                        try:
+                            async with httpx.AsyncClient() as check_client:
+                                res = await check_client.get(link, follow_redirects=False, timeout=10)
+                                target = res.headers.get("Location", "")
+                                if "discord.com/verify" in target:
+                                    return link
+                        except Exception:
+                            continue
+        except Exception as e:
+            log_event("WARNING", f"hotmail007: graph request failed: {str(e)[:150]}")
         return None
 
 
