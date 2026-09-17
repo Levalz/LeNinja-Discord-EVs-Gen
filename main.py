@@ -189,56 +189,53 @@ except ImportError:
     GROQ_AVAILABLE = False
 
 
-FREEK_EXT_ID = "dknlfmjaanfblgfdfebhijalfmhmjjjo"
-FREEK_EXT_DIR = Path(get_path("extension/nopecha_ext"))
-FREEK_KEYS_FILE = Path(get_path("config/nopecha.txt"))
+LENINJA_EXT_ID = "dknlfmjaanfblgfdfebhijalfmhmjjjo"
+LENINJA_EXT_DIR = Path(get_path("extension/nopecha_ext"))
+LENINJA_KEYS_FILE = Path(get_path("config/nopecha.txt"))
 FP_FILE = Path(get_path("input/fp.txt"))
 _fp_lock = threading.Lock()
-FREEK_KEY_INDEX = 0
+LENINJA_KEY_INDEX = 0
 
 
-def load_freek_keys() -> list:
-    if not FREEK_KEYS_FILE.exists():
-        FREEK_KEYS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        FREEK_KEYS_FILE.write_text("")
+def load_leninja_keys() -> list:
+    if not LENINJA_KEYS_FILE.exists():
+        LENINJA_KEYS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        LENINJA_KEYS_FILE.write_text("")
         return []
     keys = []
-    for line in FREEK_KEYS_FILE.read_text().splitlines():
+    for line in LENINJA_KEYS_FILE.read_text().splitlines():
         line = line.strip()
         if line and not line.startswith('#'):
             keys.append(line)
     return keys
 
 
-def get_current_freek_key() -> Optional[str]:
-    keys = load_freek_keys()
+def get_current_leninja_key() -> Optional[str]:
+    keys = load_leninja_keys()
     if not keys:
         return None
-    global FREEK_KEY_INDEX
-    return keys[FREEK_KEY_INDEX % len(keys)]
+    global LENINJA_KEY_INDEX
+    return keys[LENINJA_KEY_INDEX % len(keys)]
 
 
-def inject_freek_key(api_key: str):
-    if not api_key or not FREEK_EXT_DIR.exists():
+def inject_leninja_key(api_key: str):
+    if not api_key or not LENINJA_EXT_DIR.exists():
         return False
     ok = False
 
     # 1. Inject into manifest.json
-    manifest_path = FREEK_EXT_DIR / "manifest.json"
+    manifest_path = LENINJA_EXT_DIR / "manifest.json"
     try:
         if manifest_path.exists():
             with open(manifest_path, 'r', encoding='utf-8') as f:
                 manifest = json.load(f)
 
-            # Get all keys from nopecha.txt
-            all_keys = load_freek_keys()
+            all_keys = load_leninja_keys()
 
-            # Update nopecha.key with the first key
             if 'nopecha' not in manifest:
                 manifest['nopecha'] = {}
             manifest['nopecha']['key'] = api_key
 
-            # Update nopecha.keys with all keys
             if all_keys:
                 manifest['nopecha']['keys'] = all_keys
 
@@ -249,7 +246,7 @@ def inject_freek_key(api_key: str):
         pass
 
     # 2. Inject into settings.json
-    settings_path = FREEK_EXT_DIR / "settings.json"
+    settings_path = LENINJA_EXT_DIR / "settings.json"
     try:
         settings = {}
         if settings_path.exists():
@@ -266,7 +263,7 @@ def inject_freek_key(api_key: str):
     replacement = f'key:me(ge(),{json.dumps(api_key)})'
     pattern = re.compile(r'key:me\(ge\(\),\"[^\"]*\"\)')
     try:
-        for bundle_path in FREEK_EXT_DIR.rglob("*.js"):
+        for bundle_path in LENINJA_EXT_DIR.rglob("*.js"):
             try:
                 bundle = bundle_path.read_text(encoding="utf-8", errors="ignore")
                 new_bundle, count = pattern.subn(replacement, bundle, count=1)
@@ -278,16 +275,16 @@ def inject_freek_key(api_key: str):
     except:
         pass
     return ok
-def download_freek_ext() -> Optional[Path]:
-    if FREEK_EXT_DIR.exists() and (FREEK_EXT_DIR / "manifest.json").exists():
-        return FREEK_EXT_DIR
-    log_event("INFO", "downloading freek extension (first run)...")
-    crx_url = f"https://clients2.google.com/service/update2/crx?response=redirect&prodversion=120.0.0.0&acceptformat=crx2,crx3&x=id%3D{FREEK_EXT_ID}%26uc"
+def download_leninja_ext() -> Optional[Path]:
+    if LENINJA_EXT_DIR.exists() and (LENINJA_EXT_DIR / "manifest.json").exists():
+        return LENINJA_EXT_DIR
+    log_event("INFO", "downloading leninja extension (first run)...")
+    crx_url = f"https://clients2.google.com/service/update2/crx?response=redirect&prodversion=120.0.0.0&acceptformat=crx2,crx3&x=id%3D{LENINJA_EXT_ID}%26uc"
     try:
         with httpx.Client(follow_redirects=True) as client:
             r = client.get(crx_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=60)
             if r.status_code != 200:
-                log_event("ERROR", f"freek download failed: HTTP {r.status_code}")
+                log_event("ERROR", f"leninja download failed: HTTP {r.status_code}")
                 return None
             data = r.content
         if data[:4] == b"Cr24":
@@ -295,33 +292,33 @@ def download_freek_ext() -> Optional[Path]:
             zip_start = (12 + int.from_bytes(data[8:12], "little")) if version == 3 else (16 + int.from_bytes(data[8:12], "little") + int.from_bytes(data[12:16], "little"))
         else:
             zip_start = 0
-        FREEK_EXT_DIR.mkdir(exist_ok=True, parents=True)
+        LENINJA_EXT_DIR.mkdir(exist_ok=True, parents=True)
         with zipfile.ZipFile(io.BytesIO(data[zip_start:])) as z:
-            z.extractall(FREEK_EXT_DIR)
-        if (FREEK_EXT_DIR / "manifest.json").exists():
-            log_event("SUCCESS", "freek extension installed")
-            return FREEK_EXT_DIR
-        log_event("ERROR", "freek extract failed: manifest.json missing")
+            z.extractall(LENINJA_EXT_DIR)
+        if (LENINJA_EXT_DIR / "manifest.json").exists():
+            log_event("SUCCESS", "leninja extension installed")
+            return LENINJA_EXT_DIR
+        log_event("ERROR", "leninja extract failed: manifest.json missing")
         return None
     except Exception as e:
-        log_event("ERROR", f"freek download failed: {str(e)[:100]}")
+        log_event("ERROR", f"leninja download failed: {str(e)[:100]}")
         return None
 
 
-async def setup_freek(log_func=None):
+async def setup_leninja(log_func=None):
     _l = log_func or log_event
-    ext_path = download_freek_ext()
+    ext_path = download_leninja_ext()
     if not ext_path:
-        _l("ERROR", "Failed to download Freek extension")
+        _l("ERROR", "Failed to download LeNinja extension")
         return None
-    current_key = get_current_freek_key()
+    current_key = get_current_leninja_key()
     if current_key:
-        if inject_freek_key(current_key):
-            _l("SUCCESS", "freek key injected")
+        if inject_leninja_key(current_key):
+            _l("SUCCESS", "leninja key injected")
         else:
-            _l("WARNING", "freek key could not be injected (check extension files)")
+            _l("WARNING", "leninja key could not be injected (check extension files)")
     else:
-        _l("WARNING", "no freek key in config/nopecha.txt - captcha solving will be limited")
+        _l("WARNING", "no leninja key in config/nopecha.txt - captcha solving will be limited")
     return ext_path
 
 
@@ -425,11 +422,16 @@ def print_stats_bar(valid, locked, invalid):
     print(f"\r {Fore.LIGHTGREEN_EX}Valid: {valid} {Fore.LIGHTBLACK_EX}| {Fore.LIGHTYELLOW_EX}Locked: {locked} {Fore.LIGHTBLACK_EX}| {Fore.LIGHTRED_EX}Invalid: {invalid} {Fore.LIGHTBLACK_EX}| {Fore.LIGHTCYAN_EX}Total: {total}{Style.RESET_ALL}")
 
 
-def set_console_title(title="Freek - Token Generator"):
+def set_console_title(title="LeNinja - Discord EVs Generator"):
     if os.name == 'nt':
         os.system(f"title {title}")
     else:
-        print(f"\33]0;{title}\a", end='', flush=True)
+        try:
+            stream = sys.__stdout__ or sys.stdout
+            stream.write(f"\33]0;{title}\a")
+            stream.flush()
+        except Exception:
+            pass
 
 
 def clear_screen():
@@ -503,14 +505,14 @@ def show_interface():
     ascii_art = """
 ╔═══════════════════════════════════════════════════════════════╗
 ║                                                               ║
-║   ███████╗██████╗ ███████╗███████╗██╗  ██╗                   ║
-║   ██╔════╝██╔══██╗██╔════╝██╔════╝██║ ██╔╝                   ║
-║   █████╗  ██████╔╝█████╗  █████╗  █████╔╝                    ║
-║   ██╔══╝  ██╔══██╗██╔══╝  ██╔══╝  ██╔═██╗                    ║
-║   ██║     ██║  ██║███████╗███████╗██║  ██╗                   ║
-║   ╚═╝     ╚═╝  ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝                   ║
+║   ██╗     ███████╗███╗   ██╗██╗███╗   ██╗     ██╗ █████╗     ║
+║   ██║     ██╔════╝████╗  ██║██║████╗  ██║     ██║██╔══██╗    ║
+║   ██║     █████╗  ██╔██╗ ██║██║██╔██╗ ██║     ██║███████║    ║
+║   ██║     ██╔══╝  ██║╚██╗██║██║██║╚██╗██║██   ██║██╔══██║    ║
+║   ███████╗███████╗██║ ╚████║██║██║ ╚████║╚█████╔╝██║  ██║    ║
+║   ╚══════╝╚══════╝╚═╝  ╚═══╝╚═╝╚═╝  ╚═══╝ ╚════╝ ╚═╝  ╚═╝    ║
 ║                                                               ║
-║              AI-Powered CAPTCHA Solver v1.0                   ║
+║          Discord EVs Generator · AI CAPTCHA v1.0              ║
 ║                                                               ║
 ╚═══════════════════════════════════════════════════════════════╝
     """
@@ -2272,7 +2274,7 @@ async def main():
         log_event("WARNING", f"no api key found for service '{service.upper()}'. please check config.yaml")
 
     clear_screen()
-    ext_path = await setup_freek(log_event)
+    ext_path = await setup_leninja(log_event)
     _fp_count = len(_load_fp_lines())
     if _fp_count > 0:
         log_event("INFO", f"{_fp_count} fingerprint(s) loaded from input/fp.txt")
