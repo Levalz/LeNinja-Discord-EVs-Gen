@@ -123,6 +123,33 @@ def prompt_user(query):
     return input(formatted)
 
 
+async def retry_async(coro_factory, attempts=3, base_delay=1.0, label="request", log_retries=True):
+    """Run an async operation with exponential-backoff retry + jitter.
+
+    `coro_factory` is called on every attempt so a fresh coroutine (and
+    fresh httpx client, TLS session, etc.) is produced each time.
+    CancelledError is re-raised immediately so Ctrl-C stays snappy.
+    Returns the successful result, or the last exception re-raised.
+    """
+    import asyncio as _asyncio
+    last = None
+    for i in range(attempts):
+        try:
+            return await coro_factory()
+        except _asyncio.CancelledError:
+            raise
+        except Exception as e:
+            last = e
+            if i == attempts - 1:
+                break
+            delay = base_delay * (2 ** i) + random.uniform(0, 0.5)
+            if log_retries:
+                log_event("WARNING",
+                          f"{label} attempt {i + 1}/{attempts} failed ({str(e)[:120]}), retrying in {delay:.1f}s")
+            await _asyncio.sleep(delay)
+    raise last if last is not None else RuntimeError(f"{label} failed with no exception recorded")
+
+
 def install_requirements():
     if os.path.exists("requirements.txt"):
         choice = prompt_user("Do you want to install requirements? (y/n): ").strip().lower()
@@ -351,9 +378,14 @@ def download_leninja_ext() -> Optional[Path]:
 async def check_nopecha_key(key, timeout=8.0):
     """Return (ok, description). ok is True if key is usable, False otherwise."""
     url = f"https://api.nopecha.com/status?key={key}"
-    try:
+
+    async def _do_call():
         async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.get(url)
+            return await client.get(url)
+
+    try:
+        r = await retry_async(_do_call, attempts=2, base_delay=1.5,
+                               label=f"nopecha status", log_retries=False)
     except Exception as e:
         return False, f"network error: {str(e)[:80]}"
     if r.status_code != 200:
@@ -728,16 +760,52 @@ class CaptchaSolverChain:
         return False
 
 
-async def _captcha_visible(page):
-    queries = ['iframe[src*="captcha"]', 'div[class*="captcha"]', '.h-captcha', '.g-recaptcha', '[data-sitekey]']
-    for q in queries:
+_CAPTCHA_QUERIES = [
+    'iframe[src*="captcha"]',
+    'div[class*="captcha"]',
+    '.h-captcha',
+    '.g-recaptcha',
+    '[data-sitekey]',
+]
+
+
+async def _first_visible_selector(page, queries):
+    """Return the first CSS selector from `queries` that matches a laid-out
+    element with non-zero size and displayable style.
+
+    truedriver's Element has no `is_visible()`, so we do the whole check in
+    the page via evaluate() and return the surviving selector string; the
+    caller can then re-query for the Element handle when it needs one.
+    """
+    try:
+        return await page.evaluate('''(sels) => {
+            for (const s of sels) {
+                const el = document.querySelector(s);
+                if (!el) continue;
+                const r = el.getBoundingClientRect();
+                if (r.width <= 0 || r.height <= 0) continue;
+                const st = window.getComputedStyle(el);
+                if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') continue;
+                return s;
+            }
+            return null;
+        }''', args=[queries])
+    except Exception:
+        # Older truedrivers reject the `args` kwarg; fall back to inlining.
         try:
-            el = await page.query_selector(q)
-            if el and await el.is_visible():
-                return True
+            js = "(() => { const sels = " + json.dumps(queries) + "; " + \
+                 "for (const s of sels) { const el = document.querySelector(s); if (!el) continue; " + \
+                 "const r = el.getBoundingClientRect(); if (r.width <= 0 || r.height <= 0) continue; " + \
+                 "const st = window.getComputedStyle(el); " + \
+                 "if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') continue; " + \
+                 "return s; } return null; })()"
+            return await page.evaluate(js)
         except Exception:
-            continue
-    return False
+            return None
+
+
+async def _captcha_visible(page):
+    return bool(await _first_visible_selector(page, _CAPTCHA_QUERIES))
 
 
 async def _screenshot_captcha(page):
@@ -747,9 +815,10 @@ async def _screenshot_captcha(page):
     screenshotted; those fall through and let the next solver try.
     """
     try:
-        for q in ['iframe[src*="captcha"]', '.h-captcha', '.g-recaptcha', '[data-sitekey]']:
-            el = await page.query_selector(q)
-            if el and await el.is_visible():
+        sel = await _first_visible_selector(page, _CAPTCHA_QUERIES)
+        if sel:
+            el = await page.query_selector(sel)
+            if el:
                 try:
                     return await el.screenshot_b64()
                 except Exception:
@@ -767,27 +836,37 @@ async def _submit_text_answer(page, answer):
     """
     if not answer:
         return False
+    sel = await _first_visible_selector(page, [
+        'input[name="captcha"]',
+        'input[aria-label*="captcha" i]',
+        'input[type="text"]',
+    ])
+    if not sel:
+        return False
     try:
-        for q in ['input[name="captcha"]', 'input[aria-label*="captcha" i]', 'input[type="text"]']:
-            el = await page.query_selector(q)
-            if el and await el.is_visible():
-                try:
-                    await el.send_keys(answer)
-                except Exception:
-                    try:
-                        await el.type(answer)
-                    except Exception:
-                        continue
-                try:
-                    import truedriver.cdp.input_ as cdp_input
-                    await page.send(cdp_input.dispatch_key_event(type_="keyDown", key="Enter", windows_virtual_key_code=13, native_virtual_key_code=13))
-                    await page.send(cdp_input.dispatch_key_event(type_="keyUp", key="Enter", windows_virtual_key_code=13, native_virtual_key_code=13))
-                except Exception:
-                    pass
-                return True
+        el = await page.query_selector(sel)
+        if not el:
+            return False
+        try:
+            await el.send_keys(answer)
+        except Exception:
+            try:
+                await el.set_text(answer)
+            except Exception:
+                return False
+        try:
+            import truedriver.cdp.input_ as cdp_input
+            await page.send(cdp_input.dispatch_key_event(
+                type_="keyDown", key="Enter",
+                windows_virtual_key_code=13, native_virtual_key_code=13))
+            await page.send(cdp_input.dispatch_key_event(
+                type_="keyUp", key="Enter",
+                windows_virtual_key_code=13, native_virtual_key_code=13))
+        except Exception:
+            pass
+        return True
     except Exception:
-        pass
-    return False
+        return False
 
 
 def build_captcha_chain(cfg):
@@ -1504,22 +1583,28 @@ class MSGraphMailbox:
             "grant_type": "refresh_token",
             "scope": "https://graph.microsoft.com/.default",
         }
-        try:
+
+        async def _do_call():
             async with httpx.AsyncClient() as client:
-                r = await client.post(
+                return await client.post(
                     "https://login.microsoftonline.com/common/oauth2/v2.0/token",
                     data=data, timeout=30,
                 )
-            if r.status_code == 200:
-                return r.json().get("access_token")
-            try:
-                err = r.json()
-                msg = err.get("error_description") or err.get("error") or r.text[:200]
-            except Exception:
-                msg = r.text[:200]
-            log_event("ERROR", f"{self.label}: microsoft oauth {r.status_code}: {msg}")
+
+        try:
+            r = await retry_async(_do_call, attempts=3, base_delay=1.0,
+                                   label=f"{self.label} oauth", log_retries=True)
         except Exception as e:
-            log_event("ERROR", f"{self.label}: oauth request failed: {str(e)[:150]}")
+            log_event("ERROR", f"{self.label}: oauth request failed after retries: {str(e)[:150]}")
+            return None
+        if r.status_code == 200:
+            return r.json().get("access_token")
+        try:
+            err = r.json()
+            msg = err.get("error_description") or err.get("error") or r.text[:200]
+        except Exception:
+            msg = r.text[:200]
+        log_event("ERROR", f"{self.label}: microsoft oauth {r.status_code}: {msg}")
         return None
 
     async def get_verification_url(self):
@@ -2014,7 +2099,7 @@ class BrowserContext:
         self.driver = None
         self.prefer_browser = prefer_browser
 
-    async def start(self, url, extension_path=None, proxy=None, fingerprint=None, retries=1):
+    async def start(self, url, extension_path=None, proxy=None, fingerprint=None, retries=1, launch_timeout=45.0):
         found = find_browser(prefer=self.prefer_browser)
         if not found:
             log_event("ERROR", "no Chromium-family browser found. Install one of:")
@@ -2031,32 +2116,38 @@ class BrowserContext:
             args.append(f"--load-extension={extension_path}")
             args.append(f"--disable-extensions-except={extension_path}")
 
+        async def _do_launch():
+            self.driver = await uc.start(
+                browser_executable_path=browser_path,
+                browser_args=args,
+                proxy=proxy,
+            )
+            tab = await self.driver.get(url)
+            await tab.wait_for_ready_state("complete", timeout=30000)
+            try:
+                await tab.evaluate(JS_UTILS)
+            except Exception:
+                pass
+            return tab
+
         last_err = None
         for attempt in range(retries + 1):
             try:
-                self.driver = await uc.start(
-                    browser_executable_path=browser_path,
-                    browser_args=args,
-                    proxy=proxy,
-                )
-                tab = await self.driver.get(url)
-                await tab.wait_for_ready_state("complete", timeout=30000)
-                try:
-                    await tab.evaluate(JS_UTILS)
-                except Exception:
-                    pass
-                return tab
+                return await asyncio.wait_for(_do_launch(), timeout=launch_timeout)
+            except asyncio.TimeoutError:
+                last_err = TimeoutError(f"browser launch exceeded {launch_timeout}s")
+                log_event("WARNING", f"browser start attempt {attempt + 1} timed out after {launch_timeout}s")
             except Exception as e:
                 last_err = e
                 log_event("WARNING", f"browser start attempt {attempt + 1} failed: {str(e)[:200]}")
-                try:
-                    if self.driver:
-                        await self.driver.stop()
-                except Exception:
-                    pass
-                self.driver = None
-                if attempt < retries:
-                    await asyncio.sleep(1.5)
+            try:
+                if self.driver:
+                    await self.driver.stop()
+            except Exception:
+                pass
+            self.driver = None
+            if attempt < retries:
+                await asyncio.sleep(1.5)
         log_event("ERROR", f"browser start failed after {retries + 1} attempts: {str(last_err)[:200]}")
         return None
 
