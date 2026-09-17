@@ -358,7 +358,8 @@ class GroqCaptchaSolver:
                 max_tokens=100
             )
             return resp.choices[0].message.content.strip().replace('"', '').replace('.', '')
-        except:
+        except Exception as e:
+            log_event("WARNING", f"groq captcha solve failed: {str(e)[:150]}")
             return None
 
 
@@ -879,105 +880,63 @@ async def rotate_mullvad_ip():
     return new_ip is not None and new_ip != current_ip
 
 
-class MailboxClient:
-    def __init__(self, api_token):
-        self.email = None
-        self.api_base = "https://api.cybertemp.xyz"
-        self.token = api_token
-        self.domain = None
-        self.password = None
+_DISCORD_VERIFY_PATTERNS = [
+    r'https?://(?:www\.)?discord\.com/verify\?token=[a-zA-Z0-9\-\._~%]+',
+    r'https?://click\.discord\.com/ls/click\?upn=[a-zA-Z0-9\-\._~%]+',
+]
 
-    async def get_domain(self):
-        try:
-            headers = {"X-API-KEY": self.token}
-            params = {"type": "discord", "limit": 20}
-            async with httpx.AsyncClient() as session:
-                response = await session.get(f"{self.api_base}/getDomains", headers=headers, params=params)
-                if response.status_code == 200:
-                    data = response.json()
-                    if data:
-                        excluded = ["altmails.icu"]
-                        filtered = [d for d in data if not d.endswith('.store') and not d.endswith('.ng') and d not in excluded]
-                        if filtered:
-                            return random.choice(filtered)
-                        return random.choice([d for d in data if d not in excluded]) if any(d not in excluded for d in data) else "cybertemp.xyz"
-        except:
-            pass
-        return "cybertemp.xyz"
 
-    async def create_inbox(self):
-        try:
-            self.domain = await self.get_domain()
-            user = ''.join(random.choices(string.ascii_lowercase + string.digits, k=random.randint(14, 18)))
-            self.email = f"{user}@{self.domain}"
-            self.password = create_random_string(12)
-            return self.email
-        except:
-            pass
+def extract_discord_verify_link(content, min_length=50):
+    if not content:
         return None
-
-    async def get_verification_url(self):
-        if not self.email:
-            return None
-        headers = {"X-API-KEY": self.token}
-        params = {"email": self.email, "limit": 5}
-        async with httpx.AsyncClient() as session:
-            try:
-                response = await session.get(f"{self.api_base}/getMail", headers=headers, params=params, timeout=15)
-                if response.status_code == 200:
-                    emails = response.json()
-                    if isinstance(emails, list):
-                        for mail in emails:
-                            content = mail.get('html', '') or mail.get('text', '')
-                            subj = mail.get('subject', '')
-                            if "verify" in subj.lower() or "discord" in subj.lower():
-                                patterns = [
-                                    r'https?://click\.discord\.com/ls/click\?upn=[a-zA-Z0-9\-\._~%]+',
-                                    r'https?://discord\.com/verify\?token=[a-zA-Z0-9\-\._~%]+'
-                                ]
-                                links = []
-                                for pattern in patterns:
-                                    matches = re.findall(pattern, content)
-                                    for match in matches:
-                                        url = match.replace('\\/', '/').split("\n")[0].strip()
-                                        url = url.replace('&amp;', '&')
-                                        if "click.discord.com/ls/click?upn=" in url or "discord.com/verify?token=" in url:
-                                            if len(url) > 50:
-                                                links.append(url)
-                                if links:
-                                    links.sort(key=len, reverse=True)
-                                    return links[0]
-            except Exception:
-                pass
+    text = str(content).replace("&amp;", "&").replace("&quot;", '"').replace("&#39;", "'")
+    found = []
+    for pattern in _DISCORD_VERIFY_PATTERNS:
+        for url in re.findall(pattern, text, re.IGNORECASE):
+            url = url.replace("\\/", "/").split("\n")[0].strip()
+            url = re.sub(r"[.,;>]$", "", url)
+            if len(url) > min_length:
+                found.append(url)
+    if not found:
         return None
+    verify = [u for u in found if "discord.com/verify" in u]
+    (verify or found).sort(key=len, reverse=True)
+    return (verify or found)[0]
 
-class Hotmail007Provider:
-    def __init__(self, client_key, mail_type="hotmail"):
-        self.client_key = (client_key or "").strip()
-        self.mail_type = mail_type
+
+class MSGraphMailbox:
+    """Base for brokers that hand back Microsoft refresh_tokens.
+
+    Subclasses provide `create_inbox`; the OAuth token refresh and the
+    Graph inbox scan are identical across every Microsoft-backed broker.
+    """
+    ms_client_id = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
+    label = "mailbox"
+
+    def __init__(self):
         self.email = None
         self.password = None
         self.refresh_token = None
         self.uuid = None
-        self.base_api = "https://gapi.hotmail007.com/api"
-        self.ms_client_id = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
 
     async def get_access_token(self, r_token=None, c_id=None):
         token = (r_token or self.refresh_token or "").rstrip("$").strip()
         cid = (c_id or self.uuid or self.ms_client_id or "").strip()
         if not token:
-            log_event("ERROR", "hotmail007: missing refresh_token")
+            log_event("ERROR", f"{self.label}: missing refresh_token")
             return None
-        url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
         data = {
             "client_id": cid,
             "refresh_token": token,
             "grant_type": "refresh_token",
-            "scope": "https://graph.microsoft.com/.default"
+            "scope": "https://graph.microsoft.com/.default",
         }
         try:
             async with httpx.AsyncClient() as client:
-                r = await client.post(url, data=data, timeout=30)
+                r = await client.post(
+                    "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+                    data=data, timeout=30,
+                )
             if r.status_code == 200:
                 return r.json().get("access_token")
             try:
@@ -985,10 +944,275 @@ class Hotmail007Provider:
                 msg = err.get("error_description") or err.get("error") or r.text[:200]
             except Exception:
                 msg = r.text[:200]
-            log_event("ERROR", f"hotmail007: microsoft oauth {r.status_code}: {msg}")
+            log_event("ERROR", f"{self.label}: microsoft oauth {r.status_code}: {msg}")
         except Exception as e:
-            log_event("ERROR", f"hotmail007: oauth request failed: {str(e)[:150]}")
+            log_event("ERROR", f"{self.label}: oauth request failed: {str(e)[:150]}")
         return None
+
+    async def get_verification_url(self):
+        if not self.refresh_token:
+            return None
+        access = await self.get_access_token()
+        if not access:
+            return None
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(
+                    "https://graph.microsoft.com/v1.0/me/messages",
+                    headers={"Authorization": f"Bearer {access}"},
+                    params={"$top": 10, "$orderby": "receivedDateTime desc", "$select": "subject,body,from"},
+                    timeout=15,
+                )
+            if r.status_code != 200:
+                log_event("WARNING", f"{self.label}: graph {r.status_code}: {r.text[:150]}")
+                return None
+            for msg in r.json().get("value", []):
+                subj = msg.get("subject", "").lower()
+                from_data = msg.get("from", {}).get("emailAddress", {})
+                frm_addr = from_data.get("address", "").lower()
+                frm_name = from_data.get("name", "").lower()
+                if not (("discord" in frm_addr or "discord" in frm_name)
+                        and ("verify" in subj or "confirm" in subj or "verification" in subj)):
+                    continue
+                body = msg.get("body", {}).get("content", "") or ""
+                link = extract_discord_verify_link(body)
+                if link:
+                    return link
+                for tracked in re.findall(r'https://click\.discord\.com/ls/click\?[^\s"\'><]+', body):
+                    try:
+                        async with httpx.AsyncClient() as check_client:
+                            res = await check_client.get(tracked, follow_redirects=False, timeout=10)
+                            if "discord.com/verify" in res.headers.get("Location", ""):
+                                return tracked
+                    except Exception:
+                        continue
+        except Exception as e:
+            log_event("WARNING", f"{self.label}: graph request failed: {str(e)[:150]}")
+        return None
+
+
+class HydraMailProvider:
+    """Base for API-Platform 'Hydra' style mail brokers (DuckMail, CrowMail)."""
+    api_base = ""
+    label = "mailbox"
+
+    def __init__(self, api_key=None, never_expire=False):
+        self.email = None
+        self.password = None
+        self.api_key = api_key
+        self.auth_token = None
+        self.account_id = None
+        self.never_expire = never_expire
+
+    def _headers(self, content_type=False):
+        h = {}
+        if content_type:
+            h["Content-Type"] = "application/json"
+        if self.api_key:
+            h["Authorization"] = f"Bearer {self.api_key}"
+        return h
+
+    def get_domains(self):
+        try:
+            response = requests.get(f"{self.api_base}/domains", headers=self._headers(), timeout=15, impersonate="chrome124")
+        except Exception as e:
+            log_event("ERROR", f"{self.label}: domains request failed: {str(e)[:150]}")
+            return None
+        if response.status_code != 200:
+            log_event("ERROR", f"{self.label}: domains HTTP {response.status_code}: {response.text[:150]}")
+            return None
+        try:
+            members = response.json().get("hydra:member", []) or []
+        except Exception:
+            log_event("ERROR", f"{self.label}: non-json domains response")
+            return None
+        valid = [item.get("domain") for item in members
+                 if item.get("domain") and item.get("isVerified")
+                 and not is_domain_blacklisted(item.get("domain"))]
+        return valid or None
+
+    async def create_inbox(self, session=None):
+        domains = self.get_domains()
+        if not domains:
+            log_event("ERROR", f"{self.label}: no verified domains available")
+            return None
+        domain = random.choice(domains)
+        user = "".join(random.choices(string.ascii_lowercase + string.digits, k=random.randint(10, 16)))
+        self.email = f"{user}@{domain}"
+        self.password = create_random_string(12)
+
+        payload = {
+            "address": self.email,
+            "password": self.password,
+            "expiresIn": 0 if self.never_expire else 86400,
+        }
+        try:
+            create_resp = requests.post(
+                f"{self.api_base}/accounts",
+                headers=self._headers(content_type=True),
+                json=payload, timeout=15, impersonate="chrome124",
+            )
+        except Exception as e:
+            log_event("ERROR", f"{self.label}: account create failed: {str(e)[:150]}")
+            return None
+        if create_resp.status_code not in (200, 201):
+            log_event("ERROR", f"{self.label}: account create HTTP {create_resp.status_code}: {create_resp.text[:200]}")
+            return None
+
+        try:
+            token_resp = requests.post(
+                f"{self.api_base}/token",
+                headers={"Content-Type": "application/json"},
+                json={"address": self.email, "password": self.password},
+                timeout=15, impersonate="chrome124",
+            )
+        except Exception as e:
+            log_event("ERROR", f"{self.label}: token request failed: {str(e)[:150]}")
+            return None
+        if token_resp.status_code == 200:
+            td = token_resp.json()
+            self.auth_token = td.get("token")
+            self.account_id = td.get("id")
+        else:
+            log_event("WARNING", f"{self.label}: token HTTP {token_resp.status_code}: {token_resp.text[:150]}")
+        return self.email
+
+    async def get_verification_url(self):
+        if not self.auth_token:
+            return None
+        headers = {"Authorization": f"Bearer {self.auth_token}"}
+        try:
+            for _ in range(3):
+                response = requests.get(f"{self.api_base}/messages", headers=headers, timeout=15, impersonate="chrome124")
+                if response.status_code == 200:
+                    messages = response.json().get("hydra:member", []) or []
+                    if isinstance(messages, list):
+                        for mail in messages:
+                            subject = str(mail.get("subject", "") or "").lower()
+                            from_data = mail.get("from", {}) or {}
+                            from_address = str(from_data.get("address", "") or "").lower()
+                            from_name = str(from_data.get("name", "") or "").lower()
+                            is_discord = "discord" in from_address or "discord" in from_name
+                            has_verify = "verify" in subject or "confirm" in subject or "verification" in subject
+                            if not (is_discord or has_verify):
+                                continue
+                            msg_id = mail.get("id")
+                            if not msg_id:
+                                continue
+                            detail_resp = requests.get(f"{self.api_base}/messages/{msg_id}", headers=headers, timeout=15, impersonate="chrome124")
+                            if detail_resp.status_code != 200:
+                                continue
+                            msg_detail = detail_resp.json()
+                            parts = [str(msg_detail.get("text", "") or "")]
+                            for html_body in (msg_detail.get("html", []) or []):
+                                parts.append(str(html_body or ""))
+                            link = extract_discord_verify_link("\n".join(parts))
+                            if link:
+                                return link
+                await asyncio.sleep(1)
+        except Exception as e:
+            log_event("WARNING", f"{self.label}: verify scan failed: {str(e)[:150]}")
+        return None
+
+
+class MailboxClient:
+    def __init__(self, api_token):
+        self.email = None
+        self.api_base = "https://api.cybertemp.xyz"
+        self.token = (api_token or "").strip()
+        self.domain = None
+        self.password = None
+
+    async def get_domain(self):
+        try:
+            async with httpx.AsyncClient() as session:
+                response = await session.get(
+                    f"{self.api_base}/getDomains",
+                    headers={"X-API-KEY": self.token},
+                    params={"type": "discord", "limit": 20},
+                    timeout=15,
+                )
+            if response.status_code != 200:
+                log_event("WARNING", f"cybertemp: getDomains {response.status_code}: {response.text[:150]}")
+                return "cybertemp.xyz"
+            data = response.json() or []
+            excluded = {"altmails.icu"}
+            filtered = [d for d in data if not d.endswith(".store") and not d.endswith(".ng") and d not in excluded]
+            if filtered:
+                return random.choice(filtered)
+            usable = [d for d in data if d not in excluded]
+            return random.choice(usable) if usable else "cybertemp.xyz"
+        except Exception as e:
+            log_event("WARNING", f"cybertemp: getDomains failed: {str(e)[:150]}")
+            return "cybertemp.xyz"
+
+    async def create_inbox(self):
+        if not self.token:
+            log_event("ERROR", "cybertemp: no api key set (config/config.yaml -> cybertemp_key)")
+            return None
+        self.domain = await self.get_domain()
+        user = "".join(random.choices(string.ascii_lowercase + string.digits, k=random.randint(14, 18)))
+        self.email = f"{user}@{self.domain}"
+        self.password = create_random_string(12)
+        return self.email
+
+    async def get_verification_url(self):
+        if not self.email:
+            return None
+        try:
+            async with httpx.AsyncClient() as session:
+                response = await session.get(
+                    f"{self.api_base}/getMail",
+                    headers={"X-API-KEY": self.token},
+                    params={"email": self.email, "limit": 5},
+                    timeout=15,
+                )
+            if response.status_code != 200:
+                log_event("WARNING", f"cybertemp: getMail {response.status_code}: {response.text[:150]}")
+                return None
+            emails = response.json()
+            if not isinstance(emails, list):
+                return None
+            for mail in emails:
+                subj = str(mail.get("subject", "") or "").lower()
+                if "verify" not in subj and "discord" not in subj:
+                    continue
+                content = mail.get("html", "") or mail.get("text", "")
+                link = extract_discord_verify_link(content)
+                if link:
+                    return link
+        except Exception as e:
+            log_event("WARNING", f"cybertemp: getMail failed: {str(e)[:150]}")
+        return None
+
+def _parse_broker_credential(raw, default_client_id):
+    """Parse an 'email:password:refresh_token[:client_id]' record from a broker.
+
+    Splits at most 3 times so that a password containing ':' is not corrupted,
+    strips whitespace/BOM, and falls back to `default_client_id` when the
+    broker omits the client id.
+    """
+    if raw is None:
+        return None
+    text = (raw if isinstance(raw, str) else str(raw)).strip().lstrip("﻿")
+    parts = text.split(":", 3)
+    if len(parts) < 3:
+        return None
+    email = parts[0].strip()
+    password = parts[1].strip()
+    refresh_token = parts[2].strip()
+    client_id = parts[3].strip() if len(parts) >= 4 and parts[3].strip() else default_client_id
+    return email, password, refresh_token, client_id
+
+
+class Hotmail007Provider(MSGraphMailbox):
+    label = "hotmail007"
+
+    def __init__(self, client_key, mail_type="hotmail"):
+        super().__init__()
+        self.client_key = (client_key or "").strip()
+        self.mail_type = mail_type
+        self.base_api = "https://gapi.hotmail007.com/api"
 
     async def create_inbox(self):
         if not self.client_key:
@@ -1001,439 +1225,95 @@ class Hotmail007Provider:
         except Exception as e:
             log_event("ERROR", f"hotmail007: network error: {str(e)[:150]}")
             return None
-
         if r.status_code != 200:
             log_event("ERROR", f"hotmail007: HTTP {r.status_code}: {r.text[:200]}")
             return None
-
         try:
             data = r.json()
         except Exception:
             log_event("ERROR", f"hotmail007: non-json response: {r.text[:200]}")
             return None
-
         if data.get("code") != 0 or not data.get("success"):
             msg = data.get("msg") or data.get("message") or data.get("error") or str(data)[:200]
             log_event("ERROR", f"hotmail007: api error (code={data.get('code')}): {msg}")
             return None
-
         accounts = data.get("data") or []
         if not accounts:
             log_event("ERROR", "hotmail007: api returned empty account list (check balance / stock)")
             return None
-
-        raw = accounts[0] if isinstance(accounts[0], str) else str(accounts[0])
-        raw = raw.strip().lstrip("﻿")
-        parts = raw.split(":", 3)
-        if len(parts) < 3:
-            log_event("ERROR", f"hotmail007: unexpected account format: {raw[:80]}")
+        parsed = _parse_broker_credential(accounts[0], self.ms_client_id)
+        if not parsed:
+            log_event("ERROR", f"hotmail007: unexpected account format: {str(accounts[0])[:80]}")
             return None
-
-        self.email = parts[0].strip()
-        self.password = parts[1].strip()
-        self.refresh_token = parts[2].strip()
-        self.uuid = parts[3].strip() if len(parts) >= 4 and parts[3].strip() else self.ms_client_id
+        self.email, self.password, self.refresh_token, self.uuid = parsed
         return self.email
 
-    async def get_verification_url(self):
-        if not self.refresh_token:
-            return None
-        access = await self.get_access_token()
-        if not access:
-            return None
-        try:
-            async with httpx.AsyncClient() as client:
-                r = await client.get(
-                    "https://graph.microsoft.com/v1.0/me/messages",
-                    headers={"Authorization": f"Bearer {access}"},
-                    params={"$top": 10, "$orderby": "receivedDateTime desc", "$select": "subject,body,from"},
-                    timeout=15
-                )
-            if r.status_code != 200:
-                log_event("WARNING", f"hotmail007: graph {r.status_code}: {r.text[:150]}")
-                return None
-            for msg in r.json().get("value", []):
-                subj = msg.get("subject", "").lower()
-                from_data = msg.get("from", {}).get("emailAddress", {})
-                frm_addr = from_data.get("address", "").lower()
-                frm_name = from_data.get("name", "").lower()
-                is_discord = "discord" in frm_addr or "discord" in frm_name
-                has_verify = "verify" in subj or "confirm" in subj or "verification" in subj
-                if is_discord and has_verify:
-                    body = msg.get("body", {}).get("content", "")
-                    body = body.replace("&amp;", "&").replace("&quot;", '"').replace("&#39;", "'")
-                    matches = re.findall(r'https://discord\.com/verify\?token=[^\s"\'><]+', body)
-                    if matches:
-                        return matches[0]
-                    tracked_links = re.findall(r'https://click\.discord\.com/ls/click\?[^\s"\'><]+', body)
-                    for link in tracked_links:
-                        try:
-                            async with httpx.AsyncClient() as check_client:
-                                res = await check_client.get(link, follow_redirects=False, timeout=10)
-                                target = res.headers.get("Location", "")
-                                if "discord.com/verify" in target:
-                                    return link
-                        except Exception:
-                            continue
-        except Exception as e:
-            log_event("WARNING", f"hotmail007: graph request failed: {str(e)[:150]}")
-        return None
 
+class ZeusXProvider(MSGraphMailbox):
+    label = "zeus-x"
 
-class ZeusXProvider:
     def __init__(self, api_key, account_code="HOTMAIL"):
-        self.api_key = api_key
+        super().__init__()
+        self.api_key = (api_key or "").strip()
         self.account_code = account_code
-        self.email = None
-        self.password = None
-        self.refresh_token = None
-        self.uuid = None
         self.base_api = "https://api.zeus-x.ru"
-        self.ms_client_id = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
-
-    async def get_access_token(self, r_token=None, c_id=None):
-        try:
-            token = (r_token or self.refresh_token).rstrip("$")
-            cid = c_id or self.uuid or self.ms_client_id
-            url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
-            data = {
-                "client_id": cid,
-                "refresh_token": token,
-                "grant_type": "refresh_token",
-                "scope": "https://graph.microsoft.com/.default"
-            }
-            async with httpx.AsyncClient() as client:
-                r = await client.post(url, data=data, timeout=30)
-                if r.status_code == 200:
-                    return r.json().get("access_token")
-        except:
-            pass
-        return None
 
     async def create_inbox(self):
+        if not self.api_key:
+            log_event("ERROR", "zeus-x: no api key set (config/config.yaml -> zeusx_key)")
+            return None
         url = f"{self.base_api}/purchase?apikey={self.api_key}&accountcode={self.account_code}&quantity=1"
         try:
             async with httpx.AsyncClient() as client:
                 r = await client.get(url, timeout=30)
-                if r.status_code == 200:
-                    data = r.json()
-                    accounts = data.get("data", [])
-                    if not accounts and isinstance(data, list):
-                        accounts = data
-                    
-                    if accounts:
-                        parts = accounts[0].split(":")
-                        if len(parts) >= 4:
-                            self.email = parts[0].strip()
-                            self.password = parts[1].strip()
-                            self.refresh_token = parts[2].strip()
-                            self.uuid = parts[3].strip()
-                            return self.email
-                        elif len(parts) >= 3:
-                            self.email = parts[0].strip()
-                            self.password = parts[1].strip()
-                            self.refresh_token = parts[2].strip()
-                            return self.email
+        except Exception as e:
+            log_event("ERROR", f"zeus-x: network error: {str(e)[:150]}")
+            return None
+        if r.status_code != 200:
+            log_event("ERROR", f"zeus-x: HTTP {r.status_code}: {r.text[:200]}")
+            return None
+        try:
+            data = r.json()
         except Exception:
-            pass
-        return None
-
-    async def get_verification_url(self):
-        if not self.refresh_token:
+            log_event("ERROR", f"zeus-x: non-json response: {r.text[:200]}")
             return None
-        access = await self.get_access_token()
-        if not access:
+        if isinstance(data, list):
+            accounts = data
+        else:
+            accounts = data.get("data") or []
+        if not accounts:
+            log_event("ERROR", "zeus-x: api returned empty account list (check balance / stock)")
             return None
-        try:
-            async with httpx.AsyncClient() as client:
-                r = await client.get(
-                    "https://graph.microsoft.com/v1.0/me/messages",
-                    headers={"Authorization": f"Bearer {access}"},
-                    params={"$top": 10, "$orderby": "receivedDateTime desc", "$select": "subject,body,from"},
-                    timeout=15
-                )
-                if r.status_code == 200:
-                    for msg in r.json().get("value", []):
-                        subj = msg.get("subject", "").lower()
-                        from_data = msg.get("from", {}).get("emailAddress", {})
-                        frm_addr = from_data.get("address", "").lower()
-                        frm_name = from_data.get("name", "").lower()
-                        is_discord = "discord" in frm_addr or "discord" in frm_name
-                        has_verify = "verify" in subj or "confirm" in subj or "verification" in subj
-                        if is_discord and has_verify:
-                            body = msg.get("body", {}).get("content", "")
-                            body = body.replace("&amp;", "&").replace("&quot;", '"').replace("&#39;", "'")
-                            matches = re.findall(r'https://discord\.com/verify\?token=[^\s"\'><]+', body)
-                            if matches:
-                                return matches[0]
-                            tracked_links = re.findall(r'https://click\.discord\.com/ls/click\?[^\s"\'><]+', body)
-                            for link in tracked_links:
-                                try:
-                                    async with httpx.AsyncClient() as check_client:
-                                        res = await check_client.get(link, follow_redirects=False, timeout=10)
-                                        target = res.headers.get("Location", "")
-                                        if "discord.com/verify" in target:
-                                            return link
-                                except Exception:
-                                    continue
-        except Exception:
-            pass
-        return None
-
-
-class DuckMailProvider:
-    def __init__(self, api_key=None, never_expire=False):
-        self.email = None
-        self.password = None
-        self.api_base = "https://api.duckmail.sbs"
-        self.api_key = api_key
-        self.auth_token = None
-        self.account_id = None
-        self.never_expire = never_expire
-
-    def get_domains(self):
-        try:
-            headers = {}
-            if self.api_key:
-                headers["Authorization"] = f"Bearer {self.api_key}"
-            response = requests.get(f"{self.api_base}/domains", headers=headers, timeout=15, impersonate="chrome124")
-            if response.status_code == 200:
-                data = response.json()
-                members = data.get("hydra:member", [])
-                valid_domains = []
-                for item in members:
-                    domain = item.get("domain")
-                    if domain and item.get("isVerified") and not is_domain_blacklisted(domain):
-                        valid_domains.append(domain)
-                if valid_domains:
-                    return valid_domains
-        except:
-            pass
-        return None
-
-    async def create_inbox(self, session=None):
-        try:
-            domains = self.get_domains()
-            if not domains:
-                return None
-            domain = random.choice(domains)
-            user = "".join(random.choices(string.ascii_lowercase + string.digits, k=random.randint(10, 16)))
-            self.email = f"{user}@{domain}"
-            self.password = create_random_string(12)
-
-            headers = {"Content-Type": "application/json"}
-            if self.api_key:
-                headers["Authorization"] = f"Bearer {self.api_key}"
-            payload = {
-                "address": self.email,
-                "password": self.password,
-                "expiresIn": 0 if self.never_expire else 86400,
-            }
-            create_resp = requests.post(f"{self.api_base}/accounts", headers=headers, json=payload, timeout=15, impersonate="chrome124")
-            if create_resp.status_code not in [200, 201]:
-                return None
-
-            token_payload = {"address": self.email, "password": self.password}
-            token_resp = requests.post(f"{self.api_base}/token", headers={"Content-Type": "application/json"}, json=token_payload, timeout=15, impersonate="chrome124")
-            if token_resp.status_code == 200:
-                token_data = token_resp.json()
-                self.auth_token = token_data.get("token")
-                self.account_id = token_data.get("id")
-            return self.email
-        except:
-            pass
-        return None
-
-    async def get_verification_url(self):
-        if not self.auth_token:
+        parsed = _parse_broker_credential(accounts[0], self.ms_client_id)
+        if not parsed:
+            log_event("ERROR", f"zeus-x: unexpected account format: {str(accounts[0])[:80]}")
             return None
-        headers = {"Authorization": f"Bearer {self.auth_token}"}
-        try:
-            for _ in range(3):
-                response = requests.get(f"{self.api_base}/messages", headers=headers, timeout=15, impersonate="chrome124")
-                if response.status_code == 200:
-                    data = response.json()
-                    messages = data.get("hydra:member", [])
-                    if isinstance(messages, list):
-                        for mail in messages:
-                            subject = str(mail.get("subject", "") or "").lower()
-                            from_data = mail.get("from", {}) or {}
-                            from_address = str(from_data.get("address", "") or "").lower()
-                            from_name = str(from_data.get("name", "") or "").lower()
-                            is_discord = "discord" in from_address or "discord" in from_name
-                            has_verify = "verify" in subject or "confirm" in subject or "verification" in subject
-                            if is_discord or has_verify:
-                                msg_id = mail.get("id")
-                                if msg_id:
-                                    detail_resp = requests.get(f"{self.api_base}/messages/{msg_id}", headers=headers, timeout=15, impersonate="chrome124")
-                                    if detail_resp.status_code == 200:
-                                        msg_detail = detail_resp.json()
-                                        content_parts = []
-                                        text_body = str(msg_detail.get("text", "") or "")
-                                        if text_body:
-                                            content_parts.append(text_body)
-                                        html_bodies = msg_detail.get("html", []) or []
-                                        for html_body in html_bodies:
-                                            content_parts.append(str(html_body or ""))
-                                        full_content = "\n".join(content_parts)
-                                        patterns = [
-                                            r'https?://(?:www\.)?discord\.com/verify\?token=[a-zA-Z0-9\-\._~%]+',
-                                            r'https?://click\.discord\.com/ls/click\?upn=[a-zA-Z0-9\-\._~%]+',
-                                        ]
-                                        found_links = []
-                                        for pattern in patterns:
-                                            matches = re.findall(pattern, full_content, re.IGNORECASE)
-                                            for url in matches:
-                                                url = url.replace("\\/", "/").split("\n")[0].strip().replace("&amp;", "&")
-                                                url = re.sub(r"[.,;>]$", "", url)
-                                                if len(url) > 50:
-                                                    found_links.append(url)
-                                        if found_links:
-                                            verify_links = [link for link in found_links if "discord.com/verify" in link]
-                                            if verify_links:
-                                                verify_links.sort(key=len, reverse=True)
-                                                return verify_links[0]
-                                            found_links.sort(key=len, reverse=True)
-                                            return found_links[0]
-                await asyncio.sleep(1)
-        except:
-            pass
-        return None
+        self.email, self.password, self.refresh_token, self.uuid = parsed
+        return self.email
 
 
-class CrowMailProvider:
-    def __init__(self, api_key=None, never_expire=False):
-        self.email = None
-        self.password = None
-        self.api_base = "https://api.crowmail.sbs"
-        self.api_key = api_key
-        self.auth_token = None
-        self.account_id = None
-        self.never_expire = never_expire
+class DuckMailProvider(HydraMailProvider):
+    label = "duckmail"
+    api_base = "https://api.duckmail.sbs"
 
-    def get_domains(self):
-        try:
-            headers = {}
-            if self.api_key:
-                headers["Authorization"] = f"Bearer {self.api_key}"
-            response = requests.get(f"{self.api_base}/domains", headers=headers, timeout=15, impersonate="chrome124")
-            if response.status_code == 200:
-                data = response.json()
-                members = data.get("hydra:member", [])
-                valid_domains = []
-                for item in members:
-                    domain = item.get("domain")
-                    if domain and item.get("isVerified") and not is_domain_blacklisted(domain):
-                        valid_domains.append(domain)
-                if valid_domains:
-                    return valid_domains
-        except:
-            pass
-        return None
 
-    async def create_inbox(self, session=None):
-        try:
-            domains = self.get_domains()
-            if not domains:
-                return None
-            domain = random.choice(domains)
-            user = "".join(random.choices(string.ascii_lowercase + string.digits, k=random.randint(10, 16)))
-            self.email = f"{user}@{domain}"
-            self.password = create_random_string(12)
-
-            headers = {"Content-Type": "application/json"}
-            if self.api_key:
-                headers["Authorization"] = f"Bearer {self.api_key}"
-            payload = {
-                "address": self.email,
-                "password": self.password,
-                "expiresIn": 0 if self.never_expire else 86400,
-            }
-            create_resp = requests.post(f"{self.api_base}/accounts", headers=headers, json=payload, timeout=15, impersonate="chrome124")
-            if create_resp.status_code not in [200, 201]:
-                return None
-
-            token_payload = {"address": self.email, "password": self.password}
-            token_resp = requests.post(f"{self.api_base}/token", headers={"Content-Type": "application/json"}, json=token_payload, timeout=15, impersonate="chrome124")
-            if token_resp.status_code == 200:
-                token_data = token_resp.json()
-                self.auth_token = token_data.get("token")
-                self.account_id = token_data.get("id")
-            return self.email
-        except:
-            pass
-        return None
-
-    async def get_verification_url(self):
-        if not self.auth_token:
-            return None
-        headers = {"Authorization": f"Bearer {self.auth_token}"}
-        try:
-            for _ in range(3):
-                response = requests.get(f"{self.api_base}/messages", headers=headers, timeout=15, impersonate="chrome124")
-                if response.status_code == 200:
-                    data = response.json()
-                    messages = data.get("hydra:member", [])
-                    if isinstance(messages, list):
-                        for mail in messages:
-                            subject = str(mail.get("subject", "") or "").lower()
-                            from_data = mail.get("from", {}) or {}
-                            from_address = str(from_data.get("address", "") or "").lower()
-                            from_name = str(from_data.get("name", "") or "").lower()
-                            is_discord = "discord" in from_address or "discord" in from_name
-                            has_verify = "verify" in subject or "confirm" in subject or "verification" in subject
-                            if is_discord or has_verify:
-                                msg_id = mail.get("id")
-                                if msg_id:
-                                    detail_resp = requests.get(f"{self.api_base}/messages/{msg_id}", headers=headers, timeout=15, impersonate="chrome124")
-                                    if detail_resp.status_code == 200:
-                                        msg_detail = detail_resp.json()
-                                        content_parts = []
-                                        text_body = str(msg_detail.get("text", "") or "")
-                                        if text_body:
-                                            content_parts.append(text_body)
-                                        html_bodies = msg_detail.get("html", []) or []
-                                        for html_body in html_bodies:
-                                            content_parts.append(str(html_body or ""))
-                                        full_content = "\n".join(content_parts)
-                                        patterns = [
-                                            r'https?://(?:www\.)?discord\.com/verify\?token=[a-zA-Z0-9\-\._~%]+',
-                                            r'https?://click\.discord\.com/ls/click\?upn=[a-zA-Z0-9\-\._~%]+',
-                                        ]
-                                        found_links = []
-                                        for pattern in patterns:
-                                            matches = re.findall(pattern, full_content, re.IGNORECASE)
-                                            for url in matches:
-                                                url = url.replace("\\/", "/").split("\n")[0].strip().replace("&amp;", "&")
-                                                url = re.sub(r"[.,;>]$", "", url)
-                                                if len(url) > 50:
-                                                    found_links.append(url)
-                                        if found_links:
-                                            verify_links = [link for link in found_links if "discord.com/verify" in link]
-                                            if verify_links:
-                                                verify_links.sort(key=len, reverse=True)
-                                                return verify_links[0]
-                                            found_links.sort(key=len, reverse=True)
-                                            return found_links[0]
-                await asyncio.sleep(1)
-        except:
-            pass
-        return None
+class CrowMailProvider(HydraMailProvider):
+    label = "crowmail"
+    api_base = "https://api.crowmail.sbs"
 
 
 class AfhamMailProvider:
+    label = "afham"
+
     def __init__(self, api_key="axm_moOcVCBUD6r1FbIeThT0wEmEofjuaDnJdMiQj7OymTU"):
-        self.api_key = api_key
+        self.api_key = (api_key or "").strip()
         self.api_base = "https://api.afhamxmailz.com"
         self.email = None
         self.inbox_id = None
         self.password = None
 
     def _headers(self):
-        return {
-            "X-API-Key": self.api_key,
-            "Content-Type": "application/json",
-        }
+        return {"X-API-Key": self.api_key, "Content-Type": "application/json"}
 
     async def get_discord_domain(self):
         try:
@@ -1444,35 +1324,40 @@ class AfhamMailProvider:
                     params={"type": "discord"},
                     timeout=15,
                 )
-                if response.status_code == 200:
-                    data = response.json()
-                    if isinstance(data, list):
-                        valid = [
-                            d["domain"] for d in data
-                            if isinstance(d, dict)
-                            and d.get("status") == "active"
-                            and not d.get("domain", "").endswith(".store")
-                            and not d.get("domain", "").endswith(".ng")
-                        ]
-                        if valid:
-                            return random.choice(valid)
-        except:
-            pass
-        return None
+        except Exception as e:
+            log_event("ERROR", f"afham: domains request failed: {str(e)[:150]}")
+            return None
+        if response.status_code != 200:
+            log_event("ERROR", f"afham: domains HTTP {response.status_code}: {response.text[:150]}")
+            return None
+        try:
+            data = response.json()
+        except Exception:
+            log_event("ERROR", "afham: non-json domains response")
+            return None
+        if not isinstance(data, list):
+            log_event("ERROR", "afham: unexpected domains response shape")
+            return None
+        valid = [
+            d["domain"] for d in data
+            if isinstance(d, dict)
+            and d.get("status") == "active"
+            and not d.get("domain", "").endswith(".store")
+            and not d.get("domain", "").endswith(".ng")
+        ]
+        if not valid:
+            log_event("ERROR", "afham: no active discord-safe domains available")
+            return None
+        return random.choice(valid)
 
     async def create_inbox(self):
+        domain = await self.get_discord_domain()
+        if not domain:
+            return None
+        user = "".join(random.choices(string.ascii_lowercase + string.digits, k=random.randint(10, 16)))
+        self.password = create_random_string(12)
+        payload = {"username": user, "domain": domain, "password": self.password}
         try:
-            domain = await self.get_discord_domain()
-            if not domain:
-                return None
-
-            user = "".join(random.choices(string.ascii_lowercase + string.digits, k=random.randint(10, 16)))
-            self.password = create_random_string(12)
-            payload = {
-                "username": user,
-                "domain": domain,
-                "password": self.password,
-            }
             async with httpx.AsyncClient() as session:
                 response = await session.post(
                     f"{self.api_base}/inbox/generate",
@@ -1481,14 +1366,16 @@ class AfhamMailProvider:
                     params={"type": "discord"},
                     timeout=15,
                 )
-                if response.status_code in [200, 201]:
-                    data = response.json()
-                    self.email = data.get("address")
-                    self.inbox_id = data.get("id")
-                    return self.email
-        except:
-            pass
-        return None
+        except Exception as e:
+            log_event("ERROR", f"afham: inbox create failed: {str(e)[:150]}")
+            return None
+        if response.status_code not in (200, 201):
+            log_event("ERROR", f"afham: inbox create HTTP {response.status_code}: {response.text[:200]}")
+            return None
+        data = response.json()
+        self.email = data.get("address")
+        self.inbox_id = data.get("id")
+        return self.email
 
     async def get_verification_url(self):
         if not self.email:
@@ -1506,7 +1393,6 @@ class AfhamMailProvider:
                     data = response.json()
                     if isinstance(data, list):
                         emails = data
-
                 if not emails:
                     response = await session.get(
                         f"{self.api_base}/emails/{self.email}",
@@ -1518,7 +1404,7 @@ class AfhamMailProvider:
                         data = response.json()
                         emails = data.get("emails", []) if isinstance(data, dict) else data
 
-                for mail in emails:
+                for mail in emails or []:
                     subject = str(mail.get("subject", "") or "").lower()
                     from_address = str(mail.get("from_address", "") or "").lower()
                     from_name = str(mail.get("from_name", "") or "").lower()
@@ -1526,46 +1412,22 @@ class AfhamMailProvider:
                     has_verify = "verify" in subject or "confirm" in subject or "verification" in subject
                     if not (is_discord or has_verify):
                         continue
-
                     msg_id = mail.get("id")
                     if not msg_id:
                         continue
-
                     detail_resp = await session.get(
                         f"{self.api_base}/emails/message/{msg_id}",
-                        headers=self._headers(),
-                        timeout=15,
+                        headers=self._headers(), timeout=15,
                     )
                     if detail_resp.status_code != 200:
                         continue
-
                     msg = detail_resp.json()
-                    full_content = (
-                        str(msg.get("body_text", "") or "") + "\n" +
-                        str(msg.get("body_html", "") or "")
-                    ).replace("&amp;", "&")
-
-                    patterns = [
-                        r'https?://(?:www\.)?discord\.com/verify\?token=[a-zA-Z0-9\-\._~%]+',
-                        r'https?://click\.discord\.com/ls/click\?upn=[a-zA-Z0-9\-\._~%]+',
-                    ]
-                    links = []
-                    for pattern in patterns:
-                        for url in re.findall(pattern, full_content, re.IGNORECASE):
-                            url = url.replace("\\/", "/").split("\n")[0].strip()
-                            url = re.sub(r"[.,;>]$", "", url)
-                            if len(url) > 50:
-                                links.append(url)
-
-                    if links:
-                        verify_links = [l for l in links if "discord.com/verify" in l]
-                        if verify_links:
-                            verify_links.sort(key=len, reverse=True)
-                            return verify_links[0]
-                        links.sort(key=len, reverse=True)
-                        return links[0]
-        except:
-            pass
+                    body = str(msg.get("body_text", "") or "") + "\n" + str(msg.get("body_html", "") or "")
+                    link = extract_discord_verify_link(body)
+                    if link:
+                        return link
+        except Exception as e:
+            log_event("WARNING", f"afham: verify scan failed: {str(e)[:150]}")
         return None
 
 
@@ -2248,26 +2110,63 @@ def setup_files():
 
 
 
+SERVICES = {
+    "c": ("Cybertemp", MailboxClient, "cybertemp_key", True),
+    "h": ("Hotmail", Hotmail007Provider, "hotmail007_key", True),
+    "z": ("Zeus-X", ZeusXProvider, "zeusx_key", True),
+    "a": ("Afham", AfhamMailProvider, "afham_mail_api9_key", False),
+    "d": ("DuckMail", DuckMailProvider, "duckmail_key", False),
+    "r": ("CrowMail", CrowMailProvider, "crowmail_key", True),
+}
+
+
+def load_and_validate_config():
+    """Return (cfg, use_vpn, vpn_delay) or None on any fatal config error.
+
+    Every failure path emits one specific log_event so the user can fix
+    the config without guessing what went wrong.
+    """
+    config_path = get_path("config/config.yaml")
+    if not os.path.exists(config_path):
+        log_event("ERROR", f"config not found at: {config_path}")
+        return None
+    try:
+        with open(config_path, "r") as f:
+            cfg = yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        log_event("ERROR", f"config.yaml is not valid yaml: {str(e)[:200]}")
+        return None
+    except OSError as e:
+        log_event("ERROR", f"could not read config.yaml: {e}")
+        return None
+    if cfg is None:
+        cfg = {}
+    if not isinstance(cfg, dict):
+        log_event("ERROR", "config.yaml must be a mapping at the top level")
+        return None
+    use_vpn = bool(cfg.get("vpn", False))
+    raw_delay = cfg.get("vpn_delay", 120)
+    try:
+        vpn_delay = int(raw_delay)
+    except (TypeError, ValueError):
+        log_event("ERROR", f"config.yaml vpn_delay must be an integer, got {raw_delay!r}")
+        return None
+    if vpn_delay < 0:
+        log_event("ERROR", f"config.yaml vpn_delay must be >= 0, got {vpn_delay}")
+        return None
+    return cfg, use_vpn, vpn_delay
+
+
 async def main():
     clear_screen()
     set_console_title()
     setup_files()
-    
-    try:
-        config_path = get_path("config/config.yaml")
-        if not os.path.exists(config_path):
-            log_event("ERROR", f"config not found at: {config_path}")
-            prompt_user("press enter to exit")
-            return
 
-        with open(config_path, "r") as f:
-            cfg = yaml.safe_load(f)
-            use_vpn = cfg.get('vpn', False)
-            vpn_delay = int(cfg.get('vpn_delay', 120))
-    except Exception as e:
-        log_event("ERROR", f"config error: {e}")
+    loaded = load_and_validate_config()
+    if loaded is None:
         prompt_user("press enter to exit")
         return
+    cfg, use_vpn, vpn_delay = loaded
 
     if use_vpn:
         await mullvad_ensure_connected()
@@ -2278,29 +2177,16 @@ async def main():
     proxies = load_proxies(cfg)
 
     show_interface()
-    
-    service = prompt_user("Choose service - Cybertemp (C), Hotmail (H), Zeus-X (Z), Afham (A), DuckMail (D) or CrowMail (R): ").strip().lower()
-    if service == 'h':
-        key = cfg.get('hotmail007_key')
-        mailbox_class = Hotmail007Provider
-    elif service == 'z':
-        key = cfg.get('zeusx_key')
-        mailbox_class = ZeusXProvider
-    elif service == 'a':
-        key = cfg.get('afham_mail_api9_key', '')
-        mailbox_class = AfhamMailProvider
-    elif service == 'd':
-        key = cfg.get('duckmail_key', '')
-        mailbox_class = DuckMailProvider
-    elif service == 'r':
-        key = cfg.get('crowmail_key', '')
-        mailbox_class = CrowMailProvider
-    else:
-        key = cfg.get('cybertemp_key')
-        mailbox_class = MailboxClient
 
-    if not key and service not in ('d',):
-        log_event("WARNING", f"no api key found for service '{service.upper()}'. please check config.yaml")
+    service_prompt = "Choose service - Cybertemp (C), Hotmail (H), Zeus-X (Z), Afham (A), DuckMail (D) or CrowMail (R): "
+    choice = prompt_user(service_prompt).strip().lower()
+    if choice not in SERVICES:
+        log_event("WARNING", f"unrecognized service '{choice}', defaulting to Cybertemp")
+        choice = "c"
+    service_name, mailbox_class, key_field, key_required = SERVICES[choice]
+    key = (cfg.get(key_field) or "").strip()
+    if not key and key_required:
+        log_event("WARNING", f"no api key found for {service_name} (config.yaml -> {key_field})")
 
     clear_screen()
     ext_path = await setup_leninja(log_event)
