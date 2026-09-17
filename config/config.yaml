@@ -28,6 +28,11 @@ groq_model: ""          # empty = solver's built-in default
 anthropic_key: ""
 anthropic_model: ""     # empty = solver's built-in default
 captcha_extension_wait: 60
+# How long to wait for Discord to RENDER a challenge after the form is
+# submitted. Discord loads the hCaptcha iframe after the POST, so a short
+# window here makes the flow walk past a challenge that is still loading
+# and leave it unsolved on screen. Raise if you're on a slow proxy.
+captcha_appear_wait: 25
 
 # Preferred browser (Brave, Chrome, Chromium, Edge). Leave empty to
 # auto-detect the first installed one in that default order.

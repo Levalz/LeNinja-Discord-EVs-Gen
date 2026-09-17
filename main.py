@@ -1875,10 +1875,15 @@ def _parse_broker_credential(raw, default_client_id):
 class Hotmail007Provider(MSGraphMailbox):
     label = "hotmail007"
 
-    def __init__(self, client_key, mail_type="hotmail"):
+    # Broker codes that mean "transient, try again" rather than "give up".
+    # 23005 is literally returned as "Purchase failed, please try again".
+    RETRYABLE_CODES = {23005, 23006, 50000}
+
+    def __init__(self, client_key, mail_type="hotmail", attempts=3):
         super().__init__()
         self.client_key = (client_key or "").strip()
         self.mail_type = mail_type
+        self.attempts = max(1, int(attempts))
         self.base_api = "https://gapi.hotmail007.com/api"
 
     async def create_inbox(self):
@@ -1886,34 +1891,56 @@ class Hotmail007Provider(MSGraphMailbox):
             log_event("ERROR", "hotmail007: no api key set (config/config.yaml -> hotmail007_key)")
             return None
         url = f"{self.base_api}/mail/getMail?clientKey={self.client_key}&mailType={self.mail_type}&quantity=1"
-        try:
-            async with httpx.AsyncClient() as client:
-                r = await client.get(url, timeout=30)
-        except Exception as e:
-            log_event("ERROR", f"hotmail007: network error: {str(e)[:150]}")
-            return None
-        if r.status_code != 200:
-            log_event("ERROR", f"hotmail007: HTTP {r.status_code}: {r.text[:200]}")
-            return None
-        try:
-            data = r.json()
-        except Exception:
-            log_event("ERROR", f"hotmail007: non-json response: {r.text[:200]}")
-            return None
-        if data.get("code") != 0 or not data.get("success"):
-            msg = data.get("msg") or data.get("message") or data.get("error") or str(data)[:200]
-            log_event("ERROR", f"hotmail007: api error (code={data.get('code')}): {msg}")
-            return None
-        accounts = data.get("data") or []
-        if not accounts:
-            log_event("ERROR", "hotmail007: api returned empty account list (check balance / stock)")
-            return None
-        parsed = _parse_broker_credential(accounts[0], self.ms_client_id)
-        if not parsed:
-            log_event("ERROR", f"hotmail007: unexpected account format: {str(accounts[0])[:80]}")
-            return None
-        self.email, self.password, self.refresh_token, self.uuid = parsed
-        return self.email
+
+        for attempt in range(1, self.attempts + 1):
+            try:
+                async with httpx.AsyncClient() as client:
+                    r = await client.get(url, timeout=30)
+            except Exception as e:
+                log_event("ERROR", f"hotmail007: network error: {str(e)[:150]}")
+                return None
+            if r.status_code != 200:
+                log_event("ERROR", f"hotmail007: HTTP {r.status_code}: {r.text[:200]}")
+                return None
+            try:
+                data = r.json()
+            except Exception:
+                log_event("ERROR", f"hotmail007: non-json response: {r.text[:200]}")
+                return None
+
+            if data.get("code") != 0 or not data.get("success"):
+                code = data.get("code")
+                msg = data.get("msg") or data.get("message") or data.get("error") or str(data)[:200]
+                if code in self.RETRYABLE_CODES and attempt < self.attempts:
+                    delay = 1.5 * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+                    log_event("WARNING",
+                              f"hotmail007: transient api error (code={code}): {msg} - "
+                              f"retry {attempt}/{self.attempts - 1} in {delay:.1f}s")
+                    await asyncio.sleep(delay)
+                    continue
+                log_event("ERROR", f"hotmail007: api error (code={code}): {msg}")
+                if code in self.RETRYABLE_CODES:
+                    log_event("ERROR", "  → broker is out of stock or overloaded; try a different mailType or wait")
+                return None
+
+            accounts = data.get("data") or []
+            if not accounts:
+                if attempt < self.attempts:
+                    delay = 1.5 * (2 ** (attempt - 1))
+                    log_event("WARNING",
+                              f"hotmail007: empty account list - retry {attempt}/{self.attempts - 1} in {delay:.1f}s")
+                    await asyncio.sleep(delay)
+                    continue
+                log_event("ERROR", "hotmail007: api returned empty account list (check balance / stock)")
+                return None
+
+            parsed = _parse_broker_credential(accounts[0], self.ms_client_id)
+            if not parsed:
+                log_event("ERROR", f"hotmail007: unexpected account format: {str(accounts[0])[:80]}")
+                return None
+            self.email, self.password, self.refresh_token, self.uuid = parsed
+            return self.email
+        return None
 
 
 class ZeusXProvider(MSGraphMailbox):
@@ -2171,7 +2198,7 @@ class BrowserContext:
 
 
 class AccountCreator:
-    def __init__(self, api_key, mailbox_class, extension_path=None, proxy=None, custom_display_name=None, fingerprint=None, captcha_chain=None, prefer_browser=None):
+    def __init__(self, api_key, mailbox_class, extension_path=None, proxy=None, custom_display_name=None, fingerprint=None, captcha_chain=None, prefer_browser=None, captcha_appear_wait=25.0):
         self.extension_path = extension_path
         self.proxy = proxy
         self.custom_display_name = custom_display_name
@@ -2179,6 +2206,10 @@ class AccountCreator:
         self.mailbox = mailbox_class(api_key)
         self.browser = BrowserContext(prefer_browser=prefer_browser)
         self.captcha_chain = captcha_chain or CaptchaSolverChain([CaptchaSolver()])
+        # How long to wait for Discord to render a challenge after submit.
+        # Too short and the flow walks past a challenge that is still
+        # loading, leaving it unsolved on screen.
+        self.captcha_appear_wait = captcha_appear_wait
         self.password = None
         self.email = None
         self.token = None
@@ -2365,11 +2396,19 @@ class AccountCreator:
                         text = (await button.get_text() or "").strip()
                         if not text: text = (button.text or "").strip()
                         if text and any(keyword in text for keyword in ['Continue', 'Create', 'Submit', 'Register']):
-                            await button.click()
+                            # Mark as attempted BEFORE awaiting the click:
+                            # click() often raises because the page navigates
+                            # out from under it, and treating that as "not
+                            # clicked" made the fallbacks below fire a second
+                            # submit — which makes Discord issue a second
+                            # captcha for the same registration.
                             clicked = True
+                            await button.click()
                             break
-                    except: continue
-            except: pass
+                    except Exception:
+                        continue
+            except Exception:
+                pass
             if not clicked:
                 try:
                     submit = await page.select('[type="submit"]', timeout=0)
@@ -2438,15 +2477,52 @@ class AccountCreator:
         except Exception as e:
             pass
 
-    async def handle_challenges(self, page):
-        # Wait briefly for any challenge to appear; if none within a few
-        # seconds, the flow can proceed. If one does appear, hand it to
-        # the configured solver chain (extension first, AI fallbacks after).
-        for i in range(10):
+    async def _wait_for_captcha(self, page, timeout):
+        """Poll until a challenge is visible or `timeout` seconds elapse."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
             if await _captcha_visible(page):
-                log_event("WARNING", "captcha appeared")
-                return await self.captcha_chain.solve(page)
-            await asyncio.sleep(0.5)
+                return True
+            await asyncio.sleep(0.4)
+        return False
+
+    async def handle_challenges(self, page, max_rounds=3):
+        """Wait for a challenge, solve it, then keep watching for more.
+
+        Discord renders the hCaptcha iframe *after* the submit POST, and
+        that render routinely takes longer than a few seconds. The old
+        5-second window expired before the iframe existed, so the flow
+        moved on to email polling while the challenge sat unsolved on
+        screen — which is what made captchas look like they "kept coming
+        back" even though the extension was solving fine.
+
+        Discord also issues a fresh challenge after a solved one when it
+        doesn't like the token, so solve in a loop rather than once.
+        """
+        solved_rounds = 0
+        for round_no in range(1, max_rounds + 1):
+            # Generous window on the first round (waiting on Discord to
+            # render); short window afterwards (only catching a re-issue).
+            window = self.captcha_appear_wait if round_no == 1 else 8.0
+            if not await self._wait_for_captcha(page, window):
+                if solved_rounds:
+                    log_event("SUCCESS", f"captcha cleared after {solved_rounds} round(s)")
+                return True
+
+            log_event("WARNING", f"captcha appeared (round {round_no}/{max_rounds})")
+            if not await self.captcha_chain.solve(page):
+                self.last_failure_reason = f"captcha unsolved (round {round_no})"
+                return False
+            solved_rounds += 1
+            # Let the page settle so a re-issued challenge has time to render
+            # before the next round's short window starts counting.
+            await asyncio.sleep(2.0)
+
+        # Ran out of rounds with a challenge still on screen.
+        if await _captcha_visible(page):
+            log_event("ERROR", f"captcha still present after {max_rounds} rounds - giving up on this attempt")
+            self.last_failure_reason = f"captcha re-issued {max_rounds}x (token rejected)"
+            return False
         return True
 
     async def _hook_register_watcher(self, page):
@@ -3044,6 +3120,10 @@ async def main():
         attempt_timeout = float(cfg.get("attempt_timeout", 240))
     except (TypeError, ValueError):
         attempt_timeout = 240.0
+    try:
+        captcha_appear_wait = float(cfg.get("captcha_appear_wait", 25))
+    except (TypeError, ValueError):
+        captcha_appear_wait = 25.0
 
     async def run_one_attempt(attempt_num, worker_label=""):
         """Run a single account attempt and record its outcome in metrics.
@@ -3066,6 +3146,7 @@ async def main():
                 custom_display_name=custom_display_name,
                 fingerprint=_fp_dict, captcha_chain=captcha_chain,
                 prefer_browser=prefer_browser,
+                captcha_appear_wait=captcha_appear_wait,
             )
             try:
                 resp = await asyncio.wait_for(engine.run(), timeout=attempt_timeout)
