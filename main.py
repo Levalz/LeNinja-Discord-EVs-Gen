@@ -1853,23 +1853,38 @@ class MailboxClient:
         return None
 
 def _parse_broker_credential(raw, default_client_id):
-    """Parse an 'email:password:refresh_token[:client_id]' record from a broker.
+    """Parse a broker account record into (email, password, refresh_token, client_id).
 
-    Splits at most 3 times so that a password containing ':' is not corrupted,
-    strips whitespace/BOM, and falls back to `default_client_id` when the
-    broker omits the client id.
+    Brokers ship two shapes depending on which product you buy:
+
+        email:password                              -> basic (no OAuth)
+        email:password:refresh_token[:client_id]    -> OAuth-enabled
+
+    Splits at most 3 times so a password containing ':' is not corrupted, and
+    falls back to `default_client_id` when the broker omits the client id.
+    `refresh_token` comes back None for the basic shape — callers must check
+    it before attempting the Microsoft Graph flow.
     """
     if raw is None:
         return None
     text = (raw if isinstance(raw, str) else str(raw)).strip().lstrip("﻿")
     parts = text.split(":", 3)
-    if len(parts) < 3:
+    if len(parts) < 2 or not parts[0].strip():
         return None
     email = parts[0].strip()
     password = parts[1].strip()
-    refresh_token = parts[2].strip()
+    refresh_token = parts[2].strip() if len(parts) >= 3 and parts[2].strip() else None
     client_id = parts[3].strip() if len(parts) >= 4 and parts[3].strip() else default_client_id
     return email, password, refresh_token, client_id
+
+
+def _warn_no_oauth_credentials(label, email, field_count, config_hint):
+    """Explain the basic-vs-OAuth product mismatch in actionable terms."""
+    log_event("ERROR", f"{label}: broker returned {field_count} fields (email:password) with no refresh_token")
+    log_event("ERROR", f"  → got: {email}")
+    log_event("ERROR", f"  → this mailType sells BASIC accounts; reading the inbox needs OAuth accounts")
+    log_event("ERROR", f"  → fix: buy an OAuth/API product and set {config_hint} in config/config.yaml")
+    log_event("ERROR", f"  → expected format: email:password:refresh_token:client_id")
 
 
 class Hotmail007Provider(MSGraphMailbox):
@@ -1936,9 +1951,18 @@ class Hotmail007Provider(MSGraphMailbox):
 
             parsed = _parse_broker_credential(accounts[0], self.ms_client_id)
             if not parsed:
-                log_event("ERROR", f"hotmail007: unexpected account format: {str(accounts[0])[:80]}")
+                log_event("ERROR", f"hotmail007: unparseable account record: {str(accounts[0])[:80]}")
                 return None
-            self.email, self.password, self.refresh_token, self.uuid = parsed
+            email, password, refresh_token, client_id = parsed
+            if not refresh_token:
+                field_count = len(str(accounts[0]).split(":"))
+                _warn_no_oauth_credentials(
+                    "hotmail007", email, field_count,
+                    f'hotmail007_mail_type (current: "{self.mail_type}")',
+                )
+                log_event("ERROR", '  → common OAuth mailTypes: "outlook", "hotmail_trusted", "hotmail_oauth"')
+                return None
+            self.email, self.password, self.refresh_token, self.uuid = email, password, refresh_token, client_id
             return self.email
         return None
 
@@ -1980,9 +2004,17 @@ class ZeusXProvider(MSGraphMailbox):
             return None
         parsed = _parse_broker_credential(accounts[0], self.ms_client_id)
         if not parsed:
-            log_event("ERROR", f"zeus-x: unexpected account format: {str(accounts[0])[:80]}")
+            log_event("ERROR", f"zeus-x: unparseable account record: {str(accounts[0])[:80]}")
             return None
-        self.email, self.password, self.refresh_token, self.uuid = parsed
+        email, password, refresh_token, client_id = parsed
+        if not refresh_token:
+            field_count = len(str(accounts[0]).split(":"))
+            _warn_no_oauth_credentials(
+                "zeus-x", email, field_count,
+                f'zeusx_account_code (current: "{self.account_code}")',
+            )
+            return None
+        self.email, self.password, self.refresh_token, self.uuid = email, password, refresh_token, client_id
         return self.email
 
 
@@ -2198,12 +2230,12 @@ class BrowserContext:
 
 
 class AccountCreator:
-    def __init__(self, api_key, mailbox_class, extension_path=None, proxy=None, custom_display_name=None, fingerprint=None, captcha_chain=None, prefer_browser=None, captcha_appear_wait=25.0):
+    def __init__(self, api_key, mailbox_class, extension_path=None, proxy=None, custom_display_name=None, fingerprint=None, captcha_chain=None, prefer_browser=None, captcha_appear_wait=25.0, mailbox_kwargs=None):
         self.extension_path = extension_path
         self.proxy = proxy
         self.custom_display_name = custom_display_name
         self.fingerprint = fingerprint
-        self.mailbox = mailbox_class(api_key)
+        self.mailbox = mailbox_class(api_key, **(mailbox_kwargs or {}))
         self.browser = BrowserContext(prefer_browser=prefer_browser)
         self.captcha_chain = captcha_chain or CaptchaSolverChain([CaptchaSolver()])
         # How long to wait for Discord to render a challenge after submit.
@@ -3125,6 +3157,19 @@ async def main():
     except (TypeError, ValueError):
         captcha_appear_wait = 25.0
 
+    # Broker product selectors. These decide whether the broker hands back
+    # basic (email:password) or OAuth (email:password:refresh_token:client_id)
+    # accounts — only the latter can have their inbox read.
+    mailbox_kwargs = {}
+    if mailbox_class is Hotmail007Provider:
+        mail_type = (cfg.get("hotmail007_mail_type") or "hotmail").strip()
+        mailbox_kwargs["mail_type"] = mail_type
+        log_event("INFO", f"hotmail007 mailType: {mail_type}")
+    elif mailbox_class is ZeusXProvider:
+        account_code = (cfg.get("zeusx_account_code") or "HOTMAIL").strip()
+        mailbox_kwargs["account_code"] = account_code
+        log_event("INFO", f"zeus-x accountCode: {account_code}")
+
     async def run_one_attempt(attempt_num, worker_label=""):
         """Run a single account attempt and record its outcome in metrics.
 
@@ -3147,6 +3192,7 @@ async def main():
                 fingerprint=_fp_dict, captcha_chain=captcha_chain,
                 prefer_browser=prefer_browser,
                 captcha_appear_wait=captcha_appear_wait,
+                mailbox_kwargs=mailbox_kwargs,
             )
             try:
                 resp = await asyncio.wait_for(engine.run(), timeout=attempt_timeout)
