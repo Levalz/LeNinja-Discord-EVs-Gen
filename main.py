@@ -53,6 +53,42 @@ warnings.filterwarnings("ignore")
 logging.getLogger().setLevel(logging.CRITICAL)
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _strip_ansi(text):
+    return _ANSI_RE.sub("", text or "")
+
+
+_FILE_LOGGER = None
+
+
+def _get_file_logger():
+    """Rotating file logger under logs/leninja.log. Configured lazily so
+    imports/tests that never call it don't create the directory."""
+    global _FILE_LOGGER
+    if _FILE_LOGGER is not None:
+        return _FILE_LOGGER
+    import logging
+    from logging.handlers import RotatingFileHandler
+    logs_dir = Path(get_path("logs"))
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("leninja")
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    if not logger.handlers:
+        handler = RotatingFileHandler(
+            logs_dir / "leninja.log",
+            maxBytes=5 * 1024 * 1024,
+            backupCount=10,
+            encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(message)s"))
+        logger.addHandler(handler)
+    _FILE_LOGGER = logger
+    return logger
+
+
 def log_event(level, message):
     ts = datetime.now().strftime("%H:%M:%S")
     labels = {
@@ -64,6 +100,13 @@ def log_event(level, message):
     }
     label = labels.get(level.upper(), level.upper())
     print(f"{Fore.LIGHTBLACK_EX}{ts}{Style.RESET_ALL}  {label}  {Fore.WHITE}{message}{Style.RESET_ALL}")
+    try:
+        _get_file_logger().log(
+            {"SUCCESS": 20, "INFO": 20, "WARNING": 30, "ERROR": 40, "INPUT": 20}.get(level.upper(), 20),
+            _strip_ansi(str(message)),
+        )
+    except Exception:
+        pass
 
 
 def log_token(token_masked):
@@ -305,20 +348,77 @@ def download_leninja_ext() -> Optional[Path]:
         return None
 
 
+async def check_nopecha_key(key, timeout=8.0):
+    """Return (ok, description). ok is True if key is usable, False otherwise."""
+    url = f"https://api.nopecha.com/status?key={key}"
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(url)
+    except Exception as e:
+        return False, f"network error: {str(e)[:80]}"
+    if r.status_code != 200:
+        return False, f"HTTP {r.status_code}: {r.text[:120]}"
+    try:
+        data = r.json()
+    except Exception:
+        return False, f"non-json response: {r.text[:120]}"
+    error = data.get("error")
+    if error:
+        return False, str(error)[:120]
+    plan = data.get("plan") or data.get("subscription") or "?"
+    credit = data.get("credit")
+    if credit is None:
+        credit = data.get("credits")
+    if isinstance(credit, (int, float)) and credit <= 0:
+        return False, f"plan={plan} credit=0 (exhausted)"
+    return True, f"plan={plan} credit={credit if credit is not None else '?'}"
+
+
+async def audit_leninja_keys(log_func=None):
+    """Check every key in config/nopecha.txt in parallel and log per-key status.
+
+    Returns the number of usable keys. When zero, the caller should surface a
+    clear "no CAPTCHA solving will work" warning so the user doesn't spend a
+    long run wondering why hCaptcha keeps re-appearing.
+    """
+    _l = log_func or log_event
+    keys = load_leninja_keys()
+    if not keys:
+        return 0
+    results = await asyncio.gather(*(check_nopecha_key(k) for k in keys), return_exceptions=False)
+    alive = 0
+    for k, (ok, desc) in zip(keys, results):
+        masked = (k[:6] + "…" + k[-4:]) if len(k) > 12 else k
+        if ok:
+            _l("SUCCESS", f"nopecha key {masked}: {desc}")
+            alive += 1
+        else:
+            _l("WARNING", f"nopecha key {masked}: DEAD ({desc})")
+    return alive
+
+
 async def setup_leninja(log_func=None):
     _l = log_func or log_event
     ext_path = download_leninja_ext()
     if not ext_path:
         _l("ERROR", "Failed to download LeNinja extension")
         return None
+    keys = load_leninja_keys()
+    if not keys:
+        _l("WARNING", "no leninja key in config/nopecha.txt - captcha solving will be limited")
+        return ext_path
+    alive = await audit_leninja_keys(_l)
+    if alive == 0:
+        _l("ERROR", f"all {len(keys)} nopecha keys are dead/exhausted - hCaptcha will never solve")
+        _l("ERROR", "  → check balance at https://nopecha.com/manage")
+    else:
+        _l("INFO", f"nopecha keys: {alive}/{len(keys)} usable")
     current_key = get_current_leninja_key()
     if current_key:
         if inject_leninja_key(current_key):
             _l("SUCCESS", "leninja key injected")
         else:
             _l("WARNING", "leninja key could not be injected (check extension files)")
-    else:
-        _l("WARNING", "no leninja key in config/nopecha.txt - captcha solving will be limited")
     return ext_path
 
 
@@ -394,6 +494,78 @@ except ImportError:
 
 
 _CAPTCHA_METRICS = {"tries": {}, "wins": {}}
+
+
+class RunMetrics:
+    """Per-run counters + a printable end-of-run summary."""
+
+    def __init__(self):
+        from collections import Counter
+        self.started = time.time()
+        self.attempts = 0
+        self.valid = 0
+        self.locked = 0
+        self.invalid = 0
+        self.total_time = 0.0
+        self.per_provider = {}   # provider name -> {"ok":n, "fail":n}
+        self.per_proxy = {}      # masked proxy -> {"ok":n, "fail":n}
+        self.failure_reasons = Counter()
+
+    def record(self, provider, proxy, outcome, elapsed=0.0, reason=None):
+        """outcome: 'valid', 'locked', or 'invalid'."""
+        self.attempts += 1
+        self.total_time += max(0.0, float(elapsed or 0.0))
+        setattr(self, outcome, getattr(self, outcome) + 1)
+        ok = outcome != "invalid"
+        prov = provider or "?"
+        p_row = self.per_provider.setdefault(prov, {"ok": 0, "fail": 0})
+        p_row["ok" if ok else "fail"] += 1
+        px = _mask_proxy(proxy) if proxy else "direct"
+        px_row = self.per_proxy.setdefault(px, {"ok": 0, "fail": 0})
+        px_row["ok" if ok else "fail"] += 1
+        if not ok and reason:
+            self.failure_reasons[reason] += 1
+
+    def summary_lines(self):
+        elapsed = time.time() - self.started
+        avg = (self.total_time / self.attempts) if self.attempts else 0.0
+        lines = [
+            "",
+            f"{Fore.LIGHTMAGENTA_EX}{'═' * 63}{Style.RESET_ALL}",
+            f"{Fore.LIGHTCYAN_EX}                     RUN SUMMARY{Style.RESET_ALL}",
+            f"{Fore.LIGHTMAGENTA_EX}{'═' * 63}{Style.RESET_ALL}",
+            f"  attempts   : {self.attempts}",
+            f"  {Fore.LIGHTGREEN_EX}valid{Style.RESET_ALL}      : {self.valid}",
+            f"  {Fore.LIGHTYELLOW_EX}locked{Style.RESET_ALL}     : {self.locked}",
+            f"  {Fore.LIGHTRED_EX}invalid{Style.RESET_ALL}    : {self.invalid}",
+            f"  elapsed    : {elapsed:.1f}s (avg per attempt: {avg:.1f}s)",
+        ]
+        if self.per_provider:
+            lines.append(f"  {Fore.LIGHTCYAN_EX}per provider{Style.RESET_ALL} :")
+            for name, row in sorted(self.per_provider.items()):
+                total = row["ok"] + row["fail"]
+                lines.append(f"    {name:<12} {row['ok']}/{total}")
+        if self.per_proxy and self.per_proxy != {"direct": self.per_proxy.get("direct")}:
+            lines.append(f"  {Fore.LIGHTCYAN_EX}per proxy{Style.RESET_ALL}    :")
+            for name, row in sorted(self.per_proxy.items(),
+                                    key=lambda kv: -(kv[1]["ok"] + kv[1]["fail"]))[:10]:
+                total = row["ok"] + row["fail"]
+                lines.append(f"    {name:<30} {row['ok']}/{total}")
+        if self.failure_reasons:
+            lines.append(f"  {Fore.LIGHTCYAN_EX}top failures{Style.RESET_ALL} :")
+            for reason, n in self.failure_reasons.most_common(5):
+                lines.append(f"    {n:>3}x  {reason}")
+        lines.append(f"  {Fore.LIGHTCYAN_EX}captcha{Style.RESET_ALL}      : {captcha_metrics_summary()}")
+        lines.append(f"{Fore.LIGHTMAGENTA_EX}{'═' * 63}{Style.RESET_ALL}")
+        return lines
+
+    def print_summary(self):
+        for line in self.summary_lines():
+            print(line)
+            try:
+                _get_file_logger().info(_strip_ansi(line))
+            except Exception:
+                pass
 
 
 def _record_solver(name, success):
@@ -1910,6 +2082,7 @@ class AccountCreator:
         self.password = None
         self.email = None
         self.token = None
+        self.last_failure_reason = None
         self.session = tls_client.Session(
             client_identifier="chrome_131",
             random_tls_extension_order=True
@@ -1995,9 +2168,14 @@ class AccountCreator:
             return None, 0
 
     async def human_type(self, element, text: str):
-        for char in text:
+        # Realistic per-character delay reduces Discord's bot-cadence signal.
+        # Values calibrated to a fast-but-human 250-400 CPM typing speed.
+        for i, char in enumerate(text):
             await element.send_keys(char)
-            await asyncio.sleep(random.uniform(0.005, 0.02))
+            delay = random.uniform(0.04, 0.12)
+            if random.random() < 0.06:
+                delay += random.uniform(0.15, 0.35)  # occasional pause / think
+            await asyncio.sleep(delay)
 
     async def clear_and_type(self, page, selector: str, value: str, timeout: int = 45):
         try:
@@ -2051,25 +2229,27 @@ class AccountCreator:
         return None 
 
     async def fill_registration_form(self, page, email: str, display_name: str, username: str, password: str) -> bool:
+        # Inter-field pauses of 200-500ms mimic a real user tab-switching
+        # between form inputs and blunts the "typed 4 fields in 800ms" signal.
         try:
             try:
                 await self.clear_and_type(page, 'input[name="email"]', email, timeout=45)
-                await asyncio.sleep(random.uniform(0.05, 0.15))
+                await asyncio.sleep(random.uniform(0.25, 0.55))
             except Exception as e:
                 return False
             try:
                 await self.clear_and_type(page, 'input[name="global_name"]', display_name, timeout=20)
-                await asyncio.sleep(random.uniform(0.05, 0.15))
+                await asyncio.sleep(random.uniform(0.2, 0.5))
             except Exception as e:
                 return False
             try:
                 await self.clear_and_type(page, 'input[name="username"]', username, timeout=20)
-                await asyncio.sleep(random.uniform(0.05, 0.15))
+                await asyncio.sleep(random.uniform(0.2, 0.5))
             except Exception as e:
                 return False
             try:
                 await self.clear_and_type(page, 'input[name="password"]', password, timeout=20)
-                await asyncio.sleep(random.uniform(0.05, 0.15))
+                await asyncio.sleep(random.uniform(0.25, 0.6))
             except Exception as e:
                 return False
             await asyncio.sleep(0.1)
@@ -2230,6 +2410,7 @@ class AccountCreator:
         if status == 429 or "1015" in text:
             retry = payload.get("retry_after") or payload.get("retry-after")
             log_event("ERROR", f"discord rate-limited (429{f', retry after {retry}s' if retry else ''}) - bad proxy reputation")
+            self.last_failure_reason = "rate-limited (bad proxy reputation)"
             return
 
         captcha_keys = payload.get("captcha_key") or []
@@ -2246,15 +2427,18 @@ class AccountCreator:
             svc = payload.get("captcha_service")
             if svc:
                 log_event("INFO", f"discord captcha service: {svc}")
+            self.last_failure_reason = f"captcha rejection: {captcha_keys[0]}"
             return
 
         errors = payload.get("errors") or {}
         if errors:
             log_event("ERROR", f"discord register error: {str(errors)[:250]}")
+            self.last_failure_reason = f"register error: {list(errors)[:3]}"
             return
 
         if status >= 400:
             log_event("ERROR", f"discord register HTTP {status}: {text[:200]}")
+            self.last_failure_reason = f"HTTP {status}"
 
     async def get_generated_token(self, page):
         script = """
@@ -2415,11 +2599,26 @@ class AccountCreator:
 
 
 
+DEFAULT_FP_FILE = Path(get_path("data/fingerprints_default.jsonl"))
+_default_fp_cursor = 0
+
+
 def _load_fp_lines() -> list:
     if not FP_FILE.exists():
         return []
     lines = []
     for line in FP_FILE.read_text(encoding='utf-8').splitlines():
+        line = line.strip()
+        if line and not line.startswith('#'):
+            lines.append(line)
+    return lines
+
+
+def _load_default_fp_lines() -> list:
+    if not DEFAULT_FP_FILE.exists():
+        return []
+    lines = []
+    for line in DEFAULT_FP_FILE.read_text(encoding='utf-8').splitlines():
         line = line.strip()
         if line and not line.startswith('#'):
             lines.append(line)
@@ -2441,20 +2640,36 @@ def parse_fingerprint_line(raw_line: str) -> dict:
 
 
 def peek_next_fingerprint() -> tuple:
+    """Return (parsed_dict, raw_line_or_None).
+
+    User-supplied lines in input/fp.txt take priority (one-time use, consumed
+    after each account). When that file is empty, cycle through the bundled
+    default pool at data/fingerprints_default.jsonl (never consumed).
+    """
+    global _default_fp_cursor
     with _fp_lock:
         lines = _load_fp_lines()
-        if not lines:
+        if lines:
+            raw_line = lines[0]
+            return parse_fingerprint_line(raw_line), raw_line
+        defaults = _load_default_fp_lines()
+        if not defaults:
             return None, None
-        raw_line = lines[0]
-        return parse_fingerprint_line(raw_line), raw_line
+        raw_line = defaults[_default_fp_cursor % len(defaults)]
+        _default_fp_cursor += 1
+        return parse_fingerprint_line(raw_line), None
 
 
 def consume_fingerprint_line(raw_line: str) -> bool:
+    """Remove one user-supplied fingerprint after use (one-time-use design)."""
+    if raw_line is None:
+        return False
     with _fp_lock:
         lines = _load_fp_lines()
         if raw_line not in lines:
             return False
-        FP_FILE.write_text(chr(10).join(lines) + (chr(10) if lines else ""), encoding="utf-8")
+        lines.remove(raw_line)
+        FP_FILE.write_text(("\n".join(lines) + "\n") if lines else "", encoding="utf-8")
         return True
 
 
@@ -2678,10 +2893,13 @@ async def main():
     captcha_chain = build_captcha_chain(cfg)
     log_event("INFO", f"captcha chain: {', '.join(s.name for s in captcha_chain.solvers)}")
     _fp_count = len(_load_fp_lines())
+    _default_fp_count = len(_load_default_fp_lines())
     if _fp_count > 0:
-        log_event("INFO", f"{_fp_count} fingerprint(s) loaded from input/fp.txt")
+        log_event("INFO", f"{_fp_count} fingerprint(s) loaded from input/fp.txt (one-time use)")
+    elif _default_fp_count > 0:
+        log_event("INFO", f"input/fp.txt empty - rotating through {_default_fp_count} default fingerprints from data/fingerprints_default.jsonl")
     else:
-        log_event("INFO", "no fingerprints loaded (input/fp.txt empty) - running without fingerprints")
+        log_event("WARNING", "no fingerprints available - Discord may cluster accounts")
 
     
     if len(sys.argv) > 1:
@@ -2699,6 +2917,7 @@ async def main():
     done = 0
     start = time.time()
     success = 0
+    metrics = RunMetrics()
     
     try:
         while True:
@@ -2717,17 +2936,23 @@ async def main():
                     consume_fingerprint_line(_fp_raw)
 
                 run_ok = bool(resp and len(resp) == 2 and resp[0])
+                elapsed_attempt = (resp[1] if resp and len(resp) == 2 else 0) or 0
                 if run_ok:
                     token = resp[0]
                     if token == "LOCKED":
                         success += 1
+                        metrics.record(service_name, chosen_proxy, "locked", elapsed=elapsed_attempt)
                     else:
                         log_event("SUCCESS", "valid")
                         success += 1
+                        metrics.record(service_name, chosen_proxy, "valid", elapsed=elapsed_attempt)
                     if isinstance(proxy_pool, ProxyPool):
                         proxy_pool.report_success(chosen_proxy)
                 else:
                     log_event("ERROR", f"failed #{done}")
+                    metrics.record(service_name, chosen_proxy, "invalid",
+                                   elapsed=elapsed_attempt,
+                                   reason=getattr(engine, "last_failure_reason", "unknown"))
                     if isinstance(proxy_pool, ProxyPool):
                         proxy_pool.report_failure(chosen_proxy)
             except asyncio.CancelledError:
@@ -2749,9 +2974,7 @@ async def main():
     finally:
         await shutdown_engine()
         
-    elapsed = time.time() - start
-    log_event("INFO", f"generated {success} valid tokens in ({elapsed:.1f}s)")
-    log_event("INFO", f"captcha solver stats -- {captcha_metrics_summary()}")
+    metrics.print_summary()
     prompt_user("press enter to exit")
 
 if __name__ == '__main__':
