@@ -193,6 +193,7 @@ class UTILS_DISCORD:
     browser_user_agent: str = ""
 
     def __init__(self):
+        self._fallback_warned = False
         self._scrape_info()
         Thread(target=self._scrape_info_loop, daemon=True).start()
 
@@ -208,10 +209,25 @@ class UTILS_DISCORD:
                 self.discord_user_agent = details["desktop"]["user-agent"]
                 self.browser_user_agent = details["browser"]["user-agent"]
                 self.x_super_properties = details["desktop"]["decoded-x-super-properties"]
-            else:
-                self._set_fallback_values()
-        except:
-            self._set_fallback_values()
+                return
+            self._use_fallback(f"HTTP {response.status_code}")
+        except Exception as e:
+            self._use_fallback(str(e)[:100])
+
+    def _use_fallback(self, why):
+        self._set_fallback_values()
+        # Only warn once per session — stale hardcoded build_number values
+        # can make Discord reject the account with an obscure "outdated
+        # client" error, so surface this instead of silently falling back.
+        if not self._fallback_warned:
+            self._fallback_warned = True
+            try:
+                log_event("WARNING",
+                          f"discord_info endpoint unreachable ({why}) - using stale hardcoded build "
+                          f"(client_build_number=485097). If accounts start failing with "
+                          f"'outdated client', bump the fallback values.")
+            except Exception:
+                pass
 
     def _set_fallback_values(self):
         self.discord_user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) discord/1.0.9220 Chrome/128.0.6613.186 Electron/32.2.7 Safari/537.36"
@@ -2315,27 +2331,21 @@ class AccountCreator:
     async def fill_registration_form(self, page, email: str, display_name: str, username: str, password: str) -> bool:
         # Inter-field pauses of 200-500ms mimic a real user tab-switching
         # between form inputs and blunts the "typed 4 fields in 800ms" signal.
+        fields = [
+            ("email",       'input[name="email"]',       email,        45, (0.25, 0.55)),
+            ("display_name",'input[name="global_name"]', display_name, 20, (0.20, 0.50)),
+            ("username",    'input[name="username"]',    username,     20, (0.20, 0.50)),
+            ("password",    'input[name="password"]',    password,     20, (0.25, 0.60)),
+        ]
         try:
-            try:
-                await self.clear_and_type(page, 'input[name="email"]', email, timeout=45)
-                await asyncio.sleep(random.uniform(0.25, 0.55))
-            except Exception as e:
-                return False
-            try:
-                await self.clear_and_type(page, 'input[name="global_name"]', display_name, timeout=20)
-                await asyncio.sleep(random.uniform(0.2, 0.5))
-            except Exception as e:
-                return False
-            try:
-                await self.clear_and_type(page, 'input[name="username"]', username, timeout=20)
-                await asyncio.sleep(random.uniform(0.2, 0.5))
-            except Exception as e:
-                return False
-            try:
-                await self.clear_and_type(page, 'input[name="password"]', password, timeout=20)
-                await asyncio.sleep(random.uniform(0.25, 0.6))
-            except Exception as e:
-                return False
+            for name, selector, value, timeout, pause in fields:
+                try:
+                    await self.clear_and_type(page, selector, value, timeout=timeout)
+                    await asyncio.sleep(random.uniform(*pause))
+                except Exception as e:
+                    log_event("ERROR", f"form field '{name}' ({selector}) failed: {str(e)[:150]}")
+                    self.last_failure_reason = f"form field failed: {name}"
+                    return False
             await asyncio.sleep(0.1)
             await self.fill_date_of_birth(page)
             await asyncio.sleep(0.05)
@@ -2459,6 +2469,8 @@ class AccountCreator:
             log_event("WARNING", f"could not enable network domain: {str(e)[:120]}")
             return
 
+        seen_request_ids = set()
+
         async def on_response(event, connection=None):
             # truedriver calls handlers with (event, connection); accept both
             # signatures explicitly instead of relying on its TypeError retry.
@@ -2467,10 +2479,11 @@ class AccountCreator:
                 url = getattr(resp, "url", "") or ""
                 if "/auth/register" not in url and "/api/v9/register" not in url:
                     return
-                status = getattr(resp, "status", 0)
                 request_id = getattr(event, "request_id", None) or getattr(event, "requestId", None)
-                if request_id is None:
+                if request_id is None or request_id in seen_request_ids:
                     return
+                seen_request_ids.add(request_id)
+                status = getattr(resp, "status", 0)
                 # ResponseReceived fires before the body is fetchable; wait a
                 # beat so get_response_body doesn't return empty on the race.
                 await asyncio.sleep(0.3)
@@ -3027,15 +3040,23 @@ async def main():
     custom_display_name = None
     start = time.time()
     metrics = RunMetrics()
+    try:
+        attempt_timeout = float(cfg.get("attempt_timeout", 240))
+    except (TypeError, ValueError):
+        attempt_timeout = 240.0
 
     async def run_one_attempt(attempt_num, worker_label=""):
         """Run a single account attempt and record its outcome in metrics.
 
-        Called both from the serial and worker-pool paths. The `worker_label`
-        prefix (e.g. "[w2] ") lets concurrent output be attributed.
+        Wrapped in asyncio.wait_for(attempt_timeout) so a stalled browser
+        page or a captcha loop that never terminates can no longer hang the
+        entire run. The whole attempt is killed and counted as invalid.
         """
         prefix = f"{worker_label}" if worker_label else ""
         log_event("INFO", f"{prefix}creating acc # {attempt_num}")
+        engine = None
+        chosen_proxy = None
+        _fp_raw = None
         try:
             _fp_dict, _fp_raw = peek_next_fingerprint()
             chosen_proxy = proxy_pool.next() if isinstance(proxy_pool, ProxyPool) else get_random_proxy(proxy_pool)
@@ -3046,7 +3067,16 @@ async def main():
                 fingerprint=_fp_dict, captcha_chain=captcha_chain,
                 prefer_browser=prefer_browser,
             )
-            resp = await engine.run()
+            try:
+                resp = await asyncio.wait_for(engine.run(), timeout=attempt_timeout)
+            except asyncio.TimeoutError:
+                log_event("ERROR", f"{prefix}attempt timed out after {attempt_timeout:.0f}s")
+                engine.last_failure_reason = f"attempt timeout ({attempt_timeout:.0f}s)"
+                try:
+                    await engine.browser.stop()
+                except Exception:
+                    pass
+                resp = None
             if _fp_raw:
                 consume_fingerprint_line(_fp_raw)
             run_ok = bool(resp and len(resp) == 2 and resp[0])

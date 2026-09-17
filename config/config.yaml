@@ -7,6 +7,9 @@ vpn_delay: 120
 # workers > 1 disables Mullvad VPN rotation automatically (single-tunnel).
 # Override at runtime with `python main.py <target> <workers>`.
 workers: 1
+# Hard cap on a single account attempt (seconds). Kills stalled browsers
+# or captcha loops that never terminate. Kept generous by default.
+attempt_timeout: 240
 cybertemp_key: ""
 draxon_key: ""
 hotmail007_key: ""
