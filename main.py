@@ -1998,6 +1998,9 @@ class Hotmail007Provider(MSGraphMailbox):
                     log_event("ERROR", "  → broker is out of stock or overloaded; try a different mailType or wait")
                 elif code == self.UNKNOWN_MAILTYPE_CODE:
                     log_event("ERROR", f'  → "{self.mail_type}" is not a product this broker sells')
+                    if not str(self.mail_type).strip().isdigit():
+                        log_event("ERROR", "  → mailType is the NUMERIC product ID from your dashboard card")
+                        log_event("ERROR", '  → e.g. hotmail007_mail_type: "7"  (Hotmail Trusted Graph)')
                     log_event("ERROR", "  → asking the broker what it does sell:")
                     await discover_hotmail007_mail_types(self.client_key, self.base_api)
                 return None
@@ -2024,7 +2027,8 @@ class Hotmail007Provider(MSGraphMailbox):
                     "hotmail007", email, field_count,
                     f'hotmail007_mail_type (current: "{self.mail_type}")',
                 )
-                log_event("ERROR", "  → run `python main.py --list-mailtypes` to ask the broker for its product list")
+                log_event("ERROR", '  → pick a product whose name contains "Graph" (Graph = OAuth access)')
+                log_event("ERROR", '  → set its numeric dashboard ID, e.g. hotmail007_mail_type: "7"')
                 return None
             self.email, self.password, self.refresh_token, self.uuid = email, password, refresh_token, client_id
             return self.email

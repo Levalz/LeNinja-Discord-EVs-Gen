@@ -13,13 +13,18 @@ attempt_timeout: 240
 cybertemp_key: ""
 draxon_key: ""
 hotmail007_key: ""
-# Which Hotmail007 product to buy. The default "hotmail" sells BASIC
-# accounts (email:password only), which cannot have their inbox read — you
-# need an OAuth product returning email:password:refresh_token:client_id.
-# Product names are broker-specific and NOT guessable: run
-#   python main.py --list-mailtypes
-# to ask the broker for its list, or read it off your Hotmail007 dashboard.
-hotmail007_mail_type: "hotmail"
+# Which Hotmail007 product to buy. This is the NUMERIC PRODUCT ID shown on
+# the product card in your Hotmail007 dashboard (the "ID  n" field) — not a
+# name string.
+#
+# You need a product whose name includes "Graph", because Graph = Microsoft
+# Graph API access = the refresh_token required to read the inbox. Products
+# without it return only email:password and cannot be used.
+#
+#   ID 7 = "Hotmail Trusted Graph"  (Graph-Backup email, 3 months+)
+#
+# Run `python main.py --list-mailtypes` to probe for others.
+hotmail007_mail_type: "7"
 
 zeusx_key: ""
 # Same idea for Zeus-X: pick an account code whose product includes OAuth
