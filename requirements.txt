@@ -1,0 +1,6 @@
+httpx @ https://github.com/encode/httpx/archive/refs/tags/0.28.1.zip
+tls-client @ https://github.com/FlorianREGAZ/Python-Tls-Client/archive/refs/tags/1.0.1.zip
+colorama @ https://github.com/tartley/colorama/archive/refs/tags/0.4.6.zip
+truedriver
+pystyle
+pyyaml

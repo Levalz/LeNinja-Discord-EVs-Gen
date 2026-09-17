@@ -1,0 +1,12 @@
+vpn: false
+vpn_delay: 120
+cybertemp_key: ""
+draxon_key: ""
+hotmail007_key: ""
+zeusx_key: ""
+afham_mail_api9_key: ""
+duckmail_key: ""
+crowmail_key: ""
+proxy:
+  enabled: false
+  file: input/proxies.txt
